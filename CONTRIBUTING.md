@@ -11,6 +11,9 @@ Thanks for helping! A few rules keep the project healthy:
 * `cargo test --workspace` and `cargo build --release` must pass (CI checks all platforms).
 * Code style: `rustfmt` defaults, comments explain *why*.
 
+The full checklist a pull request is measured against is in
+[DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md).
+
 ## Files and licences
 
 * **Contributions are MIT**, like the rest of the code and documentation. The few
