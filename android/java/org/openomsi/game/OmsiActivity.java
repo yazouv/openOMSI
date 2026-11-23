@@ -20,6 +20,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 
 /**
  * openOMSI's activity: the game itself is native code (libopenomsi_game.so, run by
@@ -38,6 +40,8 @@ public class OmsiActivity extends NativeActivity {
     private static volatile int installStatus = 0;
     private static volatile String installMessage = "";
     private static final String ACTION_INSTALLED = "org.openomsi.game.INSTALL_STATUS";
+    private static final String EXTRA_INSTALL_TOKEN = "org.openomsi.game.INSTALL_TOKEN";
+    private static final String INSTALL_PREFS = "install";
     /** An APK waiting for the "Install unknown apps" permission. */
     private String pendingApk = null;
     private boolean askedInstallPermission = false;
@@ -54,10 +58,13 @@ public class OmsiActivity extends NativeActivity {
         }
         immersive();
         askForStorage();
+        // the launcher page over the window (the desktop launcher's, see LauncherBridge)
+        LauncherBridge.attach(this);
         // started by the package installer after an update: nothing more to do
         Intent i = getIntent();
         if (i != null && ACTION_INSTALLED.equals(i.getAction())) {
             installResult(i);
+            setIntent(new Intent());
         }
     }
 
@@ -134,6 +141,20 @@ public class OmsiActivity extends NativeActivity {
         }
     }
 
+    /** Ask for the microphone (voice chat), when it is not allowed yet: called from the native
+     *  side when voice chat is first switched on. The microphone is used only while a talk
+     *  key is held. */
+    public void requestMicrophone() {
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, 2);
+                }
+            });
+        }
+    }
+
     /** A short buzz (called from the native side for the on-screen buttons). */
     @SuppressWarnings("deprecation")
     public void vibrate(int ms) {
@@ -204,7 +225,7 @@ public class OmsiActivity extends NativeActivity {
             out.close();
             in.close();
             // the answer comes back to this activity (and, once installed, starts the new app)
-            Intent answer = new Intent(this, OmsiActivity.class).setAction(ACTION_INSTALLED);
+            Intent answer = new Intent(this, OmsiActivity.class).setAction(ACTION_INSTALLED).putExtra(EXTRA_INSTALL_TOKEN, newInstallToken());
             int flags = PendingIntent.FLAG_UPDATE_CURRENT;
             if (Build.VERSION.SDK_INT >= 31) {
                 flags |= PendingIntent.FLAG_MUTABLE;
@@ -222,14 +243,44 @@ public class OmsiActivity extends NativeActivity {
         }
     }
 
+    private String newInstallToken() {
+        byte[] b = new byte[16];
+        new SecureRandom().nextBytes(b);
+        StringBuilder t = new StringBuilder();
+        for (byte x : b) {
+            t.append(String.format("%02x", x & 0xff));
+        }
+        String token = t.toString();
+        getSharedPreferences(INSTALL_PREFS, MODE_PRIVATE).edit().putString("token", token).commit();
+        return token;
+    }
+
+    private boolean isOurInstallAnswer(Intent intent) {
+        try {
+            String want = getSharedPreferences(INSTALL_PREFS, MODE_PRIVATE).getString("token", null);
+            String got = intent.getStringExtra(EXTRA_INSTALL_TOKEN);
+            return want != null && got != null && MessageDigest.isEqual(want.getBytes(), got.getBytes());
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     @SuppressWarnings("deprecation")
     private void installResult(Intent intent) {
+        if (!isOurInstallAnswer(intent)) {
+            return;
+        }
         int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (status != PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            getSharedPreferences(INSTALL_PREFS, MODE_PRIVATE).edit().remove("token").apply();
+        }
         switch (status) {
             case PackageInstaller.STATUS_PENDING_USER_ACTION: {
                 // the system's "Do you want to update this app?"
                 Intent confirm = (Intent) intent.getParcelableExtra(Intent.EXTRA_INTENT);
                 if (confirm != null) {
+                    confirm.removeFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
                     try {
                         startActivity(confirm);
                         installStatus = 1;
@@ -249,7 +300,7 @@ public class OmsiActivity extends NativeActivity {
             case PackageInstaller.STATUS_FAILURE_CONFLICT:
             case PackageInstaller.STATUS_FAILURE_INCOMPATIBLE:
                 // signed with another key than the installed app (a build of one's own)
-                installMessage = "this openOMSI was installed from a build with another signature than the GitHub releases. Uninstall it once and install the APK from github.com/openOMSI-Project/openOMSI - updates work from then on.";
+                installMessage = "this openOMSI was installed from a build with another signature than the GitHub releases. Uninstall it once and install the APK from github.com/openOMSI-org/openOMSI - updates work from then on.";
                 installStatus = 4;
                 break;
             default: {

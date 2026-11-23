@@ -103,6 +103,17 @@ pub struct SunPlace {
     pub dst: Vec<(i32, i32, f32, f32, f32)>,
 }
 
+impl SunPlace {
+    pub fn locate(&mut self, timezone: f64, lat_lon: Option<(f64, f64)>) {
+        self.timezone = timezone;
+        match lat_lon {
+            Some((lat, lon)) => (self.latitude, self.longitude) = (lat, lon),
+            None if timezone != SunPlace::default().timezone => self.longitude = timezone * 15.0,
+            None => {}
+        }
+    }
+}
+
 impl Default for SunPlace {
     fn default() -> Self {
         SunPlace { latitude: 52.505, longitude: 13.2782, timezone: 1.0, dst: Vec::new() }
@@ -160,6 +171,30 @@ pub fn sun_position(clock: &SimClock, place: &SunPlace) -> (f64, f64) {
     (alt.to_degrees(), az.to_degrees())
 }
 
+/// The blend of the envir.cfg sky pictures (day, twilight, night) at a sun height of `alt`
+/// degrees, as Omsi.exe draws its dome (0x5d8e98): above the end of the twilight the day
+/// picture, below its start the night one, and between them the twilight picture blended
+/// towards the day (above the horizon) or the night (below it) by a weight in 256ths of
+/// the sun's height over the threshold. Omsi.exe turns the envir.cfg thresholds into
+/// radians by pi/200 where its light colours take pi/180, so its sky reaches the day at
+/// 0.9 of the twilight's end (9 degrees for the stock 10) and the night at 0.9 of its start.
+pub fn omsi_sky_weights(alt: f32, twilight: (f32, f32)) -> [f32; 3] {
+    let (start, end) = (twilight.0 * 0.9, twilight.1 * 0.9);
+    if alt > end {
+        [1.0, 0.0, 0.0]
+    } else if alt > 0.0 && end > 0.0 {
+        let w = ((alt * 256.0 / end).round()).min(255.0) / 255.0;
+        [w, 1.0 - w, 0.0]
+    } else if alt >= start && start < 0.0 {
+        let w = ((alt * 256.0 / start).round()).min(255.0) / 255.0;
+        [0.0, 1.0 - w, w]
+    } else if alt > 0.0 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
 fn stops(colors: &[[f32; 3]; 5], twilight: (f32, f32), alt: f32) -> Vec3 {
     let alts = [-90.0, twilight.0, 0.0, twilight.1, 90.0];
     let mut i = 0;
@@ -199,17 +234,7 @@ impl Daylight {
         let day = ((alt + 6.0) / 16.0).clamp(0.0, 1.0);
         let sky = Vec3::new(0.55, 0.70, 0.92) * day + Vec3::new(0.01, 0.01, 0.03) * (1.0 - day) + (a * 0.15 * (1.0 - day) * day * 4.0).min(Vec3::splat(0.3));
         let night = ((tw.1 - alt) / tw.1.max(1.0)).clamp(0.0, 1.0);
-        let sky_weights = if alt >= tw.1 {
-            [1.0, 0.0, 0.0]
-        } else if alt >= 0.0 {
-            let t = alt / tw.1.max(0.1);
-            [t, 1.0 - t, 0.0]
-        } else if alt >= tw.0 {
-            let t = (alt - tw.0) / (0.0 - tw.0).max(0.1);
-            [0.0, t, 1.0 - t]
-        } else {
-            [0.0, 0.0, 1.0]
-        };
+        let sky_weights = omsi_sky_weights(alt, tw);
         let stock = default_envir_values();
         let ratio = |own: Vec3, base: Vec3| -> Vec3 {
             // where the stock light is (nearly) black there is nothing to compare with
@@ -278,6 +303,21 @@ fn default_envir_values() -> Envir {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_sky_pictures_blend_as_omsi_blends_them() {
+        let tw = (-18.0, 10.0);
+        assert_eq!(omsi_sky_weights(30.0, tw), [1.0, 0.0, 0.0]);
+        // (the day reached at 9 degrees, 0.9 of the twilight's end)
+        assert_eq!(omsi_sky_weights(9.5, tw), [1.0, 0.0, 0.0]);
+        assert_eq!(omsi_sky_weights(0.0, tw), [0.0, 1.0, 0.0]);
+        let w = omsi_sky_weights(4.5, tw);
+        assert!((w[0] - 128.0 / 255.0).abs() < 1e-6 && (w[0] + w[1] - 1.0).abs() < 1e-6, "{w:?}");
+        let w = omsi_sky_weights(-8.1, tw);
+        assert!((w[2] - 128.0 / 255.0).abs() < 1e-6 && w[0] == 0.0, "{w:?}");
+        assert_eq!(omsi_sky_weights(-17.0, tw), [0.0, 0.0, 1.0]);
+    }
+
     use super::*;
 
     fn clock_at(hours: f64) -> SimClock {
@@ -359,5 +399,23 @@ mod tests {
         assert_eq!(d.envir_tint[1], Vec3::ONE);
         // by night the stock sun is black: nothing to compare with, no tint
         assert_eq!(Daylight::compute(&clock_at(1.0), Some(&warm)).envir_tint[0], Vec3::ONE);
+    }
+
+    #[test]
+    fn a_zone_without_a_location_keeps_its_afternoon_light() {
+        let c = SimClock { day_of_year: 69, time: 16.25 * 3600.0, ..Default::default() };
+        let mut caxias = SunPlace::default();
+        caxias.locate(-3.0, None);
+        assert!(sun_position(&c, &caxias).0 > 10.0);
+        assert_eq!(caxias.latitude, SunPlace::default().latitude, "the climate keeps its latitude");
+        let mut moscow = SunPlace::default();
+        moscow.locate(3.0, None);
+        assert_eq!((moscow.latitude, moscow.longitude), (SunPlace::default().latitude, 45.0));
+        let mut berlin = SunPlace::default();
+        berlin.locate(-3.0, Some((52.505, 13.2782)));
+        assert!(sun_position(&c, &berlin).0 < 0.0);
+        let mut spandau = SunPlace::default();
+        spandau.locate(1.0, None);
+        assert_eq!(spandau.longitude, SunPlace::default().longitude);
     }
 }

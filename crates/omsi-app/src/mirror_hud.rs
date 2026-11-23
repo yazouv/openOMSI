@@ -22,6 +22,7 @@ use winit::keyboard::KeyCode;
 /// `mirror_hud` setting: the panels a bus without a saved layout starts with.
 pub(crate) const RIGHT: u8 = 1;
 pub(crate) const LEFT: u8 = 2;
+pub(crate) const FRONT: u8 = 4;
 
 pub(crate) const HINT: &str = "Mirror editor on: its keys are listed top left";
 
@@ -113,14 +114,27 @@ impl MirrorHud {
         self.enabled && !self.panels.is_empty()
     }
 
+    /// The mirrors the panels show (each once), into `out`.
+    pub fn cams_into(&self, out: &mut Vec<usize>) {
+        out.clear();
+        for p in &self.panels {
+            if !out.contains(&p.cam) {
+                out.push(p.cam);
+            }
+        }
+    }
+
     /// The glass shapes the world has found in the bus's model.
-    pub fn set_aspects(&mut self, a: Vec<f32>) {
-        self.aspects = a;
+    /// (copied into the panels' own lists, which keep their room: this comes every frame)
+    pub fn set_aspects(&mut self, a: &[f32]) {
+        self.aspects.clear();
+        self.aspects.extend_from_slice(a);
     }
 
     /// The glasses the world has found in the bus's model.
-    pub fn set_glass(&mut self, g: Vec<Option<MirrorGlass>>) {
-        self.glass = g;
+    pub fn set_glass(&mut self, g: &[Option<MirrorGlass>]) {
+        self.glass.clear();
+        self.glass.extend_from_slice(g);
     }
 
     /// Width / height a mirror's panel starts with, and whether it sits on the right.
@@ -178,14 +192,16 @@ impl MirrorHud {
         if !self.glass.is_empty() {
             let rot = p.vehicle.body_rotation().inverse();
             let eye = rot.transform_vector3((crate::camera_util::driver_eye(p) - p.vehicle.position).as_vec3());
-            self.turns = self.glass.iter().map(|g| g.map(|g| Turn::of(eye, g.centre, g.du, g.dv)).unwrap_or_default()).collect();
+            self.turns.clear();
+            self.turns.extend(self.glass.iter().map(|g| g.map(|g| Turn::of(eye, g.centre, g.du, g.dv)).unwrap_or_default()));
         }
-        let path = p.vehicle.ty.def.path.to_string_lossy().to_string();
-        let key = path.to_ascii_lowercase();
-        if self.key == key {
+        let path = p.vehicle.ty.def.path.to_string_lossy();
+        // (compared without making the key anew every frame)
+        if self.key.len() == path.len() && self.key.bytes().zip(path.bytes()).all(|(k, c)| k == c.to_ascii_lowercase()) {
             return;
         }
-        self.key = key;
+        let path = path.into_owned();
+        self.key = path.to_ascii_lowercase();
         self.drag = None;
         self.edit = false;
         match load(&path) {
@@ -202,11 +218,29 @@ impl MirrorHud {
         self.panels.retain(|q| q.cam < n);
     }
 
+    pub fn apply_setting(&mut self, p: &Player, setting: u8) {
+        self.edit = false;
+        self.drag = None;
+        self.arrows = [false; 8];
+        self.panels = self.default_panels(p, setting);
+        self.enabled = setting != 0 && !self.panels.is_empty();
+        if !self.key.is_empty() {
+            store(&self.key, None);
+        }
+    }
+
+    pub fn start_edit(&mut self, p: &Player) -> String {
+        if self.edit {
+            return HINT.into();
+        }
+        self.toggle_edit(p)
+    }
+
     fn save(&self) {
         if self.key.is_empty() {
             return;
         }
-        save(&self.key, self.enabled, &self.panels);
+        store(&self.key, Some((self.enabled, &self.panels)));
     }
 
     /// Ctrl+M.
@@ -298,7 +332,7 @@ impl MirrorHud {
             return;
         }
         // prefer the main side mirrors, then the rest in the order the bus lists them
-        let mut order: Vec<usize> = [side_mirror(p, true), side_mirror(p, false)].into_iter().flatten().collect();
+        let mut order: Vec<usize> = [side_mirror(p, true), side_mirror(p, false), front_mirror(p)].into_iter().flatten().collect();
         let rest: Vec<usize> = (0..n).filter(|i| !order.contains(i)).collect();
         order.extend(rest);
         let Some(cam) = order.into_iter().find(|c| !self.panels.iter().any(|q| q.cam == *c)) else { return };
@@ -322,6 +356,12 @@ impl MirrorHud {
             let h = 0.30;
             let x = if right { 1.0 - MARGIN - h * aspect * 0.5625 } else { MARGIN };
             out.push(Panel { cam, x, y: 0.28, h, aspect });
+        }
+        if let Some(cam) = front_mirror(p).filter(|_| setting & FRONT != 0) {
+            let (aspect, _) = self.shape(p, cam);
+            let h = 0.22;
+            let x = (0.5 - h * aspect * 0.5625 * 0.5).max(MARGIN);
+            out.push(Panel { cam, x, y: MARGIN, h, aspect });
         }
         out
     }
@@ -447,13 +487,14 @@ impl MirrorHud {
         }
     }
 
-    /// Add the panels' pictures to the frame's overlays (after the HUD's and the
-    /// interface's, so that their indices stay put). `w` and `h` are the window's size.
+    /// Add the panels' pictures to the frame's overlays (after the navigator's and the
+    /// plugins' panels, before the notes and the menus, which record their own indices as
+    /// they are drawn). `w` and `h` are the window's size.
     pub fn push(&self, scene: &mut Scene, world: &World, w: f32, h: f32, cursor: (f32, f32)) {
         if !self.active() {
             return;
         }
-        let textures = world.mirror_textures.lock().clone();
+        let textures = world.mirror_textures.lock();
         let under = if self.editing() { self.hit(cursor.0, cursor.1, w, h) } else { None };
         for (i, q) in self.panels.iter().enumerate() {
             let Some(tex) = textures.get(q.cam).copied().flatten() else { continue };
@@ -481,14 +522,28 @@ impl MirrorHud {
 /// The reflection camera farthest out to one side of the bus (the vehicle's x grows to the
 /// right): the main mirror, not the wide-angle or ramp ones inside it.
 pub(crate) fn side_mirror(p: &Player, right: bool) -> Option<usize> {
-    p.vehicle
-        .ty
-        .def
-        .cameras_reflexion
-        .iter()
+    side_of(&p.vehicle.ty.def.cameras_reflexion, right)
+}
+
+fn side_of(cams: &[omsi_vehicle::Camera], right: bool) -> Option<usize> {
+    cams.iter()
         .enumerate()
         .filter(|(_, c)| if right { c.pos[0] > 0.3 } else { c.pos[0] < -0.3 })
         .max_by(|a, b| a.1.pos[0].abs().partial_cmp(&b.1.pos[0].abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+}
+
+pub(crate) fn front_mirror(p: &Player) -> Option<usize> {
+    front_of(&p.vehicle.ty.def.cameras_reflexion)
+}
+
+fn front_of(cams: &[omsi_vehicle::Camera]) -> Option<usize> {
+    let sides = [side_of(cams, true), side_of(cams, false)];
+    let reach = sides.iter().flatten().filter_map(|&i| cams.get(i)).map(|c| c.pos[1]).fold(f32::INFINITY, f32::min) - 1.0;
+    cams.iter()
+        .enumerate()
+        .filter(|(i, c)| !c.fixed && !sides.contains(&Some(*i)) && (!reach.is_finite() || c.pos[1] >= reach))
+        .max_by(|a, b| a.1.pos[1].partial_cmp(&b.1.pos[1]).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
 }
 
@@ -537,7 +592,7 @@ fn load(bus: &str) -> Option<(bool, Vec<Panel>)> {
     enabled.map(|e| (e, panels))
 }
 
-fn save(key: &str, enabled: bool, panels: &[Panel]) {
+fn store(key: &str, layout: Option<(bool, &[Panel])>) {
     let Some(p) = file() else { return };
     let text = std::fs::read_to_string(&p).unwrap_or_default();
     let mut lines: Vec<String> = text
@@ -545,9 +600,11 @@ fn save(key: &str, enabled: bool, panels: &[Panel]) {
         .filter(|l| l.rsplit_once('=').and_then(|(k, _)| k.rsplit_once('|')).is_none_or(|(f, _)| f.trim().to_ascii_lowercase() != key))
         .map(str::to_string)
         .collect();
-    lines.push(format!("{key}|on={}", enabled as u8));
-    for q in panels {
-        lines.push(format!("{key}|panel={},{:.4},{:.4},{:.4},{:.3}", q.cam, q.x, q.y, q.h, q.aspect));
+    if let Some((enabled, panels)) = layout {
+        lines.push(format!("{key}|on={}", enabled as u8));
+        for q in panels {
+            lines.push(format!("{key}|panel={},{:.4},{:.4},{:.4},{:.3}", q.cam, q.x, q.y, q.h, q.aspect));
+        }
     }
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
@@ -632,6 +689,19 @@ mod tests {
         assert_eq!(m.panels.last().map(|q| q.cam), Some(0));
     }
 
+    /// The mirrors drawn for the panels every frame: each shown one once, none of the others.
+    #[test]
+    fn the_panels_name_each_of_their_mirrors_once() {
+        let m = editing(vec![
+            Panel { cam: 2, x: 0.1, y: 0.1, h: 0.3, aspect: 1.0 },
+            Panel { cam: 0, x: 0.5, y: 0.5, h: 0.3, aspect: 1.0 },
+            Panel { cam: 2, x: 0.7, y: 0.1, h: 0.2, aspect: 1.0 },
+        ]);
+        let mut cams = vec![9];
+        m.cams_into(&mut cams);
+        assert_eq!(cams, vec![2, 0]);
+    }
+
     #[test]
     fn the_size_keys_change_the_panel_under_the_cursor() {
         let mut m = editing(vec![Panel { cam: 0, x: 0.1, y: 0.1, h: 0.3, aspect: 1.0 }]);
@@ -646,6 +716,21 @@ mod tests {
         assert!(!m.size_key(KeyCode::KeyA, at, (1600.0, 900.0)));
         let mut off = MirrorHud { enabled: true, panels: m.panels.clone(), ..Default::default() };
         assert!(!off.size_key(KeyCode::BracketRight, at, (1600.0, 900.0)), "outside the editor the key is the game's");
+    }
+
+    fn mirrors(at: &[[f32; 2]]) -> Vec<omsi_vehicle::Camera> {
+        at.iter().map(|&[x, y]| omsi_vehicle::Camera { pos: [x, y, 2.0], ..Default::default() }).collect()
+    }
+
+    #[test]
+    fn the_front_mirror_is_the_foremost_one_besides_the_side_mirrors() {
+        let lions_city = mirrors(&[[-1.391, 5.491], [1.383, 6.027], [-0.005, 5.2], [1.331, 6.029], [-0.574, -3.437], [-0.574, 0.993]]);
+        assert_eq!((side_of(&lions_city, false), side_of(&lions_city, true)), (Some(0), Some(1)));
+        assert_eq!(front_of(&lions_city), Some(3));
+        let sd200 = mirrors(&[[-1.332, 5.327], [1.312, 5.769], [0.218, 5.415]]);
+        assert_eq!(front_of(&sd200), Some(2), "without a front mirror, the one over the windscreen");
+        assert_eq!(front_of(&mirrors(&[[-1.3, 5.3], [1.3, 5.7], [0.4, -0.6]])), None, "a camera far back in the bus is no front mirror");
+        assert_eq!(front_of(&mirrors(&[[-1.3, 5.3], [1.3, 5.7]])), None);
     }
 
     #[test]

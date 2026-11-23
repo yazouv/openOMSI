@@ -14,6 +14,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- updates: the APK of a newer GitHub release handed to the system's installer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- voice chat in multiplayer: asked for when it is first switched on; used while a talk key is held -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- the on-screen buttons' feedback -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- the copy of OMSI 2 and the mods on the shared storage, read by path -->
@@ -25,6 +27,7 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <application
         android:label="openOMSI"
@@ -46,7 +49,7 @@
             android:resizeableActivity="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
             android:windowSoftInputMode="adjustNothing|stateHidden"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            android:theme="@style/OmsiTheme">
             <meta-data android:name="android.app.lib_name" android:value="openomsi_game" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

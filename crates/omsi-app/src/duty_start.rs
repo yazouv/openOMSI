@@ -10,15 +10,26 @@ use super::*;
 
 /// The world `place_on_duty` opened, for `open_world` to go on with: map file, date and the
 /// world with its map index and navigation map already made (it was opened twice at every
-/// duty start, a second or more on a big map).
-static PREOPENED: parking_lot::Mutex<Option<(PathBuf, i32, World)>> = parking_lot::Mutex::new(None);
+/// duty start, a second or more on a big map). It travels in the session's arguments
+/// (`Args::preopened`, shared by their clones: the map is opened on a thread of its own),
+/// so a world one session did not use is not found by the next one in the same process.
+#[derive(Clone, Default)]
+pub(crate) struct Preopened(Arc<parking_lot::Mutex<Option<(PathBuf, i32, World)>>>);
 
-/// The world opened for the duty start, if it is the one wanted now.
-pub(crate) fn take_preopened(map: &Path, date: i32) -> Option<World> {
-    let mut p = PREOPENED.lock();
-    match p.take() {
-        Some((m, d, w)) if m == map && d == date => Some(w),
-        _ => None,
+impl std::fmt::Debug for Preopened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.lock().is_some() { "Preopened(world)" } else { "Preopened(none)" })
+    }
+}
+
+impl Preopened {
+    /// The world opened for the duty start, if it is the one wanted now.
+    pub(crate) fn take(&self, map: &Path, date: i32) -> Option<World> {
+        let mut p = self.0.lock();
+        match p.take() {
+            Some((m, d, w)) if m == map && d == date => Some(w),
+            _ => None,
+        }
     }
 }
 
@@ -42,14 +53,14 @@ pub(crate) fn place_on_duty(args: &mut Args) {
     };
     world.index();
     // whatever this finds, the world goes on to the game when the function ends
-    struct Keep(Option<(PathBuf, i32, World)>);
+    struct Keep(Preopened, Option<(PathBuf, i32, World)>);
     impl Drop for Keep {
         fn drop(&mut self) {
-            *PREOPENED.lock() = self.0.take();
+            *self.0 .0.lock() = self.1.take();
         }
     }
-    let keep = Keep(Some((map_cfg, clock.date_code(), world)));
-    let world = &keep.0.as_ref().unwrap().2;
+    let keep = Keep(args.preopened.clone(), Some((map_cfg, clock.date_code(), world)));
+    let world = &keep.1.as_ref().unwrap().2;
     let mut sch = schedule::Schedule::new(&args.root, world, &clock);
     let now = parse_time(&args.time);
     let Ok(mut duty) = sch.player_duty(world, &line, args.tour.as_deref().unwrap_or(""), now, args.trip.as_deref(), args.whole_tour) else { return };
@@ -59,7 +70,8 @@ pub(crate) fn place_on_duty(args: &mut Args) {
     net.link(1.5);
     // the entry points and where they stand (heading from the object)
     let entries: Vec<(usize, String, DVec3, f64)> = {
-        let pos = world.object_positions.lock();
+        let data = world.data.peek();
+        let pos = &data.objects;
         world
             .global
             .entry_points
@@ -97,10 +109,27 @@ pub(crate) fn place_on_duty(args: &mut Args) {
                 let (path, _) = navigator::way_back(&net, from, heading, &targets, 40_000.0)?;
                 Some(path.iter().map(|&l| net.lanes[l].length() as f64).sum())
             };
-            let pick = if args.auto_entry {
+            // A trip that begins well before its first stop (a run out of the depot, whose
+            // first stop is the line's terminus) starts at the entry point where its route
+            // begins: the nearest way to the stop put the bus at the terminus and the depot
+            // run was skipped (#1642).
+            let route_start = net.lanes[route[0]].start();
+            let depot = (args.auto_entry && (p - route_start).truncate().length() > 100.0)
+                .then(|| {
+                    entries
+                        .iter()
+                        .map(|e| (e, (e.2 - route_start).truncate().length()))
+                        .filter(|(_, d)| *d < 40.0)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(e, _)| (e, route[..=li].iter().map(|&l| net.lanes[l].length() as f64).sum::<f64>()))
+                })
+                .flatten();
+            let pick = if let Some(d) = depot {
+                Some(d)
+            } else if args.auto_entry {
                 entries.iter().filter_map(|e| cost(e.2, e.3).map(|c| (e, c))).min_by(|a, b| a.1.total_cmp(&b.1))
             } else {
-                entries.iter().find(|e| e.0 == args.entry.min(entries.len().saturating_sub(1))).and_then(|e| cost(e.2, e.3).map(|c| (e, c)))
+                entries.iter().find(|e| e.0 == args.entry.min(world.global.entry_points.len().saturating_sub(1))).and_then(|e| cost(e.2, e.3).map(|c| (e, c)))
             };
             let Some(((ei, name, _, _), way)) = pick else {
                 log::info!("duty start: no entry point leads to stop {} '{}' of trip {}", j, stop.name.trim(), trip.name);
@@ -128,7 +157,7 @@ pub(crate) fn place_on_duty(args: &mut Args) {
             // stop - at town speed, with ten minutes to start the bus and set the IBIS.
             // (Not for a joining player: the clock is the host's.)
             let leave = stop.arr.max(trip.departure) - way / 7.0 - 600.0;
-            if args.lan_join.is_none() && !crate::real_time::started_synced() && leave - now > 15.0 * 60.0 {
+            if args.lan_join.is_none() && !args.start_synced && !args.keep_time && leave - now > 15.0 * 60.0 {
                 let from = schedule::hhmm(now);
                 args.time = format!("{:02}:{:02}:00", (leave / 3600.0) as i64 % 24, (leave / 60.0) as i64 % 60);
                 log::info!("duty start: the tour's first trip leaves at {}: the clock goes from {from} to {}", schedule::hhmm(trip.departure), args.time);
@@ -138,4 +167,46 @@ pub(crate) fn place_on_duty(args: &mut Args) {
         }
     }
     log::info!("duty start: no stop of the next trips can be reached from the entry points; the timetable decides, {:.1} s", t0.elapsed().as_secs_f64());
+}
+
+/// Adjust the new session's cabin once after script initialization, on any trip.
+pub(crate) fn set_starting_cabin_temperature(
+    args: &Args,
+    vehicle: &mut omsi_sim::VehicleInstance,
+) {
+    if use_comfortable_cabin(args) {
+        if args.on_foot {
+            args.pending_cabin_temperature
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            vehicle.set_cabin_temperature(22.0);
+        }
+    }
+}
+
+fn use_comfortable_cabin(args: &Args) -> bool {
+    args.comfortable_cabin_on_start && !args.is_resuming()
+}
+
+#[cfg(test)]
+mod cabin_temperature_tests {
+    use super::*;
+
+    #[test]
+    fn cabin_start_follows_switch_on_every_trip_and_preserves_saved_state() {
+        let mut args = Args::parse_from(["openomsi", "--comfortable-cabin-on-start"]);
+        assert!(use_comfortable_cabin(&args));
+        // The same enabled switch applies to the first and later trips of a tour.
+        args.line = Some("5".into());
+        args.tour = Some("1".into());
+        for trip in ["1", "2", "4"] {
+            args.trip = Some(trip.into());
+            assert!(use_comfortable_cabin(&args));
+        }
+        args.comfortable_cabin_on_start = false;
+        assert!(!use_comfortable_cabin(&args));
+        args.comfortable_cabin_on_start = true;
+        args.situation = Some("saved.osn".into());
+        assert!(!use_comfortable_cabin(&args));
+    }
 }

@@ -33,16 +33,24 @@ struct Record {
     tex: u32,
     trans: u32,
     // bit 0: alpha-tested (stochastic), bit 1: unlit (shows its own colour), bit 2: the
-    // coverage is the transmap's alpha
+    // coverage is the transmap's alpha, bits 3-4 how its textures are addressed (rt_tex.rs
+    // `address_mode`), bit 5: opaque all the same (a transmap whose alpha is not taken),
+    // bit 6: a see-through pane
     flags: u32,
-    pad: u32,
+    // its first triangle's texture coordinates (rt_tex.rs; 0xffffffff: none yet)
+    uvs: u32,
     color: vec4<f32>,
+    // the diffuse texture's coordinates: (uv + yz) * x (a texcoordtrans offset, the ground's
+    // repeat)
+    uvt: vec4<f32>,
 };
 
-// One texture's mean colour, 256 bytes apart (written with a dynamic offset, see rt.rs).
+// One texture's mean colour and its tile in the reflections' atlas (xy its corner, z 1 when
+// it is there), 256 bytes apart (written with a dynamic offset, see rt.rs).
 struct TexAvg {
     c: vec4<f32>,
-    pad: array<vec4<f32>, 15>,
+    tile: vec4<f32>,
+    pad: array<vec4<f32>, 14>,
 };
 
 @group(0) @binding(0) var<uniform> p: RtParams;
@@ -57,12 +65,22 @@ const MASK_SHADOW: u32 = 0x01u;
 const MASK_SEEN: u32 = 0x06u;
 // see-through panes (their shadow: part of the sun gets through)
 const MASK_GLASS: u32 = 0x08u;
+// ... and the same panes as the reflections' rays meet them
+const MASK_GLASS_SEEN: u32 = 0x10u;
 // Ray flags. (Not called RAY_FLAG_*: Direct3D's HLSL has those names built in, and naga
 // writes the constants out under their own names - DXC refused the redefinition, the ray
 // tracing's pipelines were never made on Windows, and every frame was thrown away.)
 const RT_FORCE_OPAQUE: u32 = 0x01u;
 const RT_FIRST_HIT: u32 = 0x04u;
 const PI: f32 = 3.14159265;
+// The roughness up to which a reflection is traced along the mirror direction alone and
+// blurred on the screen by its lobe's width (rt_denoise.wgsl `cs_atrous`); above it the
+// rays follow the lobe, a new direction every frame, and the frames are averaged. (Rays
+// scattered over the lobe of a pane, a polished coat or a wet road - one a pixel, a fresh
+// one every frame - left these, where the reflection shows most, as noise that crawled
+// whenever anything moved: the history of a lobe that narrow is thrown away at the least
+// motion. The blur gives the same soft image of the street, the same every frame.)
+const GLOSSY_MIRROR: f32 = 0.25;
 
 fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let h = p.inv_view_proj * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);

@@ -21,12 +21,19 @@ struct PostParams {
     // x Enhanced+'s grade (0/1), y the vignette's strength, z sharpening, w the tone
     // curve's contrast about mid grey (1 = none; a camera's by day, less at night)
     d: vec4<f32>,
+    // x how much of a metered shortfall (the picture darker than the light model expects: a
+    // tunnel, a dark cab) the eye makes up. Nothing anchors it as white anchors a surplus (a
+    // snow field stays white), so it follows far more of it than of a surplus.
+    e: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: PostParams;
 @group(0) @binding(1) var t_src: texture_2d<f32>;
 @group(0) @binding(2) var s_lin: sampler;
 @group(0) @binding(3) var t_base: texture_2d<f32>;
 @group(0) @binding(4) var t_adapt: texture_2d<f32>;
+// (the tone mapping's: the screen mask, whose r under 0.5 is MIST_MASK x the share of the
+// light the player's bus's misted glass scatters there - enhanced.wgsl `pane_condensation`)
+@group(0) @binding(5) var t_mask: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -74,11 +81,19 @@ fn src(uv: vec2<f32>, texel: vec2<f32>, x: f32, y: f32) -> vec3<f32> {
 // images", 1995). The alpha carries the picture's whole luminance down the chain for the
 // metering.
 const GLARE_WHITE: f32 = 1.0;
+fn is_screen_mask(m: vec4<f32>) -> bool {
+    // Clear panes attenuate both screen channels together. Condensation adds only to
+    // r; water also has b. Recover the screen code before interpreting a low r as mist.
+    let code = m.g / max(m.r, 1e-3);
+    return m.r >= 0.5 || (m.r > 0.004 && m.b < 0.004 &&
+        ((code > 0.2 && code < 0.3) || (code > 0.9 && code < 1.1)));
+}
+
 fn src_unmasked(uv: vec2<f32>, texel: vec2<f32>, x: f32, y: f32) -> vec4<f32> {
     let at = uv + vec2<f32>(x, y) * texel;
     let m = textureSampleLevel(t_base, s_lin, at, 0.0);
     let c = clean(textureSampleLevel(t_src, s_lin, at, 0.0).rgb);
-    let screen = step(0.5, m.r);
+    let screen = select(0.0, 1.0, is_screen_mask(m));
     let led = step(0.5, m.g);
     let picture = c * (1.0 - screen);
     let over = min(max(picture - vec3<f32>(GLARE_WHITE), vec3<f32>(0.0)), vec3<f32>(64.0)) + c * (led * p.c.w) * screen;
@@ -143,17 +158,41 @@ fn fs_down(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_up(in: VsOut) -> @location(0) vec4<f32> {
     let texel = 1.0 / vec2<f32>(textureDimensions(t_src));
     let uv = in.uv;
-    // (a tent a texel and a half wide: one a texel wide left the coarse levels' texels as
-    // steps round a bright source - a headlight's halo came out square)
-    let tent = (src(uv, texel, -1.5, -1.5) + src(uv, texel, 1.5, -1.5) + src(uv, texel, -1.5, 1.5) + src(uv, texel, 1.5, 1.5)
-        + (src(uv, texel, 0.0, -1.5) + src(uv, texel, -1.5, 0.0) + src(uv, texel, 1.5, 0.0) + src(uv, texel, 0.0, 1.5)) * 2.0
-        + src(uv, texel, 0.0, 0.0) * 4.0) / 16.0;
+    // (a round kernel: the centre and two rings of eight, 1 and 2 texels out - the outer
+    // turned by half a step - weighted as a Gaussian of about a texel. A 3x3 tent, however
+    // wide, is a square: a far headlamp, a pixel or two that the coarse levels hold in one
+    // texel, came back as a square halo, the squarer the further the lamp)
+    var ring1 = vec3<f32>(0.0);
+    var ring2 = vec3<f32>(0.0);
+    for (var k = 0; k < 8; k = k + 1) {
+        let a = f32(k) * 0.78539816;
+        ring1 = ring1 + src(uv, texel, cos(a), sin(a));
+        ring2 = ring2 + src(uv, texel, 2.0 * cos(a + 0.39269908), 2.0 * sin(a + 0.39269908));
+    }
+    let tent = (src(uv, texel, 0.0, 0.0) + ring1 * 0.60653066 + ring2 * 0.13533528) / (1.0 + 8.0 * 0.60653066 + 8.0 * 0.13533528);
     let base = clean(textureSampleLevel(t_base, s_lin, uv, 0.0).rgb);
     // (each level keeps a quarter of its own and passes three quarters of the wider ones
     // on: the levels' shares follow the eye's scattering - about 5.7 % of the light lands
     // 0.3-1 degree from where it should, 2.4 % at 1-3 degrees, 1.7 % at 3-10 and some 3.6 %
     // further out, CIE 146:2002's glare function integrated over those rings)
     return vec4<f32>(mix(base, tent, 0.75), 1.0);
+}
+
+// The picture as absolute radiance (1 = 10 000 cd/m²) at half size, kept for the next
+// frame's ambient occlusion: the light the surfaces of the street send to each other (the
+// bounce) is what they looked like a frame ago. Four taps at the corners of the 2x2 block.
+@fragment
+fn fs_history(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(t_src));
+    var c = (src(in.uv, texel, -0.5, -0.5) + src(in.uv, texel, 0.5, -0.5) + src(in.uv, texel, -0.5, 0.5) + src(in.uv, texel, 0.5, 0.5)) * 0.25;
+    // A small bright thing - a lamp, a spot of glare, a sign's edge - is one texel among a
+    // hundred its neighbours: of the AO's samples it takes one, and the blur turned it into a
+    // square of the blur's size. What is far brighter than what lies round it (four taps
+    // eight pixels out) is cut down to a little more than that: a wall, a sign or a window
+    // is as bright as its neighbours.
+    let ring = (src(in.uv, texel, 8.0, 0.0) + src(in.uv, texel, -8.0, 0.0) + src(in.uv, texel, 0.0, 8.0) + src(in.uv, texel, 0.0, -8.0)) * 0.25;
+    c = min(c, ring * 1.5 + vec3<f32>(0.02) * max(p.c.z, 1e-6));
+    return vec4<f32>(c / max(p.c.z, 1e-6), 1.0);
 }
 
 // --- automatic exposure: the mean log luminance of the smallest glow level, weighted to
@@ -255,14 +294,47 @@ fn filmic_grade(c: vec3<f32>) -> vec3<f32> {
     return natural_tone(c * vec3<f32>(1.015, 1.0, 0.985), max(p.d.w, 1.0));
 }
 
+// What a misted pane shows of what lies behind it: half the light its film scatters is
+// diffracted forward by the droplets, within some 2 degrees for droplets of 10 um (0.61
+// lambda / radius) - about a fortieth of the picture's height at the usual field of view -
+// so the street goes soft and every light behind the glass spreads into a glowing patch:
+// that share of the picture averaged over the lobe, from the same misted glass only (the
+// frame and the dashboard beside it keep their edges).
+const MIST_MASK: f32 = 0.24;
+fn misted(uv: vec2<f32>, c: vec3<f32>) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(t_src));
+    let px = vec2<i32>(uv * dims);
+    let mask = textureLoad(t_mask, clamp(px, vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1)), 0);
+    let m = mask.r;
+    if (m < 0.004 || is_screen_mask(mask)) {
+        return c;
+    }
+    let fog = clamp(m / MIST_MASK, 0.0, 1.0);
+    let radius = dims.y * 0.025;
+    var sum = c;
+    var w = 1.0;
+    for (var k = 1; k < 24; k = k + 1) {
+        let a = f32(k) * 2.3999632;
+        let r = sqrt(f32(k) / 23.0) * radius;
+        let q = uv + vec2<f32>(cos(a), sin(a)) * r / dims;
+        let qm = textureLoad(t_mask, clamp(vec2<i32>(q * dims), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1)), 0);
+        if (qm.r > 0.004 && !is_screen_mask(qm)) {
+            sum = sum + clean(textureSampleLevel(t_src, s_lin, q, 0.0).rgb);
+            w = w + 1.0;
+        }
+    }
+    return mix(c, sum / w, 0.5 * fog);
+}
+
 // The tone-mapped picture, encoded for the display (gamma), dithered.
 fn graded(in: VsOut) -> vec3<f32> {
-    let hdr = clean(textureSampleLevel(t_src, s_lin, in.uv, 0.0).rgb);
+    let hdr = misted(in.uv, clean(textureSampleLevel(t_src, s_lin, in.uv, 0.0).rgb));
     let glow = clean(textureSampleLevel(t_base, s_lin, in.uv, 0.0).rgb);
     // the eye's scattered light of what is brighter than the screen, added
     var c = hdr + glow * p.a.x;
     let metered = textureLoad(t_adapt, vec2<i32>(0, 0), 0).r;
-    let ev = clamp((p.b.z - metered) * p.c.x, -p.a.y, p.a.z) + p.b.w;
+    let gap = p.b.z - metered;
+    let ev = clamp(gap * select(p.c.x, p.e.x, gap > 0.0), -p.a.y, p.a.z) + p.b.w;
     c = max(c, vec3<f32>(0.0));
     if (p.c.y > 0.0) {
         c = night_vision(c, p.c.y, p.c.z);
@@ -329,7 +401,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     let rgbm = textureSampleLevel(t_src, s_lin, uv, 0.0);
     // the bus's own screens as they are: FXAA took half the contrast out of their
     // letters (the screen mask is this pass's t_base)
-    if (textureSampleLevel(t_base, s_lin, uv, 0.0).r > 0.5) {
+    if (is_screen_mask(textureSampleLevel(t_base, s_lin, uv, 0.0))) {
         return vec4<f32>(from_srgb(rgbm.rgb), 1.0);
     }
     let m = rgbm.a;

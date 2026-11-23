@@ -2,6 +2,7 @@
 
 use omsi_cfg::CfgFile;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Terminus {
@@ -26,12 +27,9 @@ impl Terminus {
 
     /// Name used by the destination menu: the identifier on the second `[addterminus]` line.
     pub fn menu_name(&self) -> String {
-        let first = self.strings.iter().find(|s| !s.trim().is_empty()).map(String::as_str).unwrap_or("").trim();
-        if !first.is_empty() && (first.eq_ignore_ascii_case("no") || is_destination_image_path(first) || has_route_label(&self.texture_id)) {
-            let id = self.texture_id.trim();
-            if !id.is_empty() {
-                return id.to_string();
-            }
+        let name = self.texture_id.trim();
+        if !name.is_empty() {
+            return name.to_string();
         }
         self.display_name()
     }
@@ -40,11 +38,6 @@ impl Terminus {
 fn is_destination_image_path(s: &str) -> bool {
     let s = s.trim().to_ascii_lowercase();
     s.ends_with(".bmp") || s.ends_with(".tga") || s.ends_with(".png")
-}
-
-fn has_route_label(s: &str) -> bool {
-    let Some((prefix, _)) = s.trim().split_once(':') else { return false };
-    !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit() || c.is_ascii_alphabetic())
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -77,10 +70,69 @@ pub struct Hof {
     pub info_busstops: Vec<Vec<String>>,
 }
 
+/// The name of the destination `Hof::with_free_text` adds (its `[addterminus]` identifier).
+pub const FREE_TEXT: &str = "(free text)";
+
 impl Hof {
+    pub fn depot_name(&self) -> String {
+        self.path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// This depot file with one destination more, or the one it had of the kind changed:
+    /// `lines` typed by the driver as the displays' text (the destination form's two free
+    /// lines). Its strings are those a destination of the file has, as many: the first holds
+    /// the first line, the second the second, every other the first again (a side or rear
+    /// sign of one line shows the destination's main line); a display that reads its text
+    /// through the scripts' `GetTerminusString` shows them. Both empty: a destination with
+    /// nothing to show, the display cleared. Its code is the file's highest and one, so no
+    /// destination of the file is taken for it. Returns the file and its index.
+    pub fn with_free_text(&self, lines: [&str; 2]) -> (Hof, usize) {
+        let mut hof = self.clone();
+        let n = self.string_count_terminus.max(self.termini.iter().map(|t| t.strings.len()).max().unwrap_or(0)).max(2);
+        let (a, b) = (lines[0].trim(), lines[1].trim());
+        let strings = (0..n).map(|k| if k == 1 { b } else { a }.to_string()).collect();
+        let index = hof.termini.iter().position(|t| t.texture_id == FREE_TEXT).unwrap_or(hof.termini.len());
+        let code = self.termini.iter().filter(|t| t.texture_id != FREE_TEXT).map(|t| t.code).max().unwrap_or(0) + 1;
+        let t = Terminus { code, texture_id: FREE_TEXT.to_string(), terminus_stop: None, all_exit: true, strings };
+        if index == hof.termini.len() {
+            hof.termini.push(t);
+        } else {
+            hof.termini[index] = t;
+        }
+        (hof, index)
+    }
+
     pub fn load(path: &Path) -> Result<Hof, omsi_cfg::CfgError> {
         let f = CfgFile::read(path)?;
         Ok(Self::parse(&f))
+    }
+
+    /// Whether the IBIS trips carry line `line` (a map's line name, "11-11s"): a trip coded
+    /// line x 100 + route, or one named after the line ("91.06A -> MASSY GARE").
+    pub fn has_line(&self, line: &str) -> bool {
+        let l = line.trim().to_ascii_lowercase();
+        if l.is_empty() {
+            return false;
+        }
+        let digits: String = l.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let number = digits.parse::<i32>().ok().filter(|n| *n > 0);
+        let encoded = encoded_hof_line(&l);
+        let boundary = |rest: &str| rest.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric());
+        self.info_trips.iter().any(|t| {
+            let code = omsi_cfg::parse_i32(&t.code);
+            let head = t.name.split("->").next().unwrap_or("").trim().to_ascii_lowercase();
+            let named = !head.is_empty()
+                && (l.strip_prefix(head.as_str()).is_some_and(boundary)
+                    || (l.ends_with(|c: char| c.is_ascii_digit())
+                        && head.strip_prefix(l.as_str()).is_some_and(|r| r.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))));
+            named
+                || number.is_some_and(|n| code >= 100 && code / 100 == n)
+                || encoded.is_some_and(|enc| code >= 100 && code / 100 == enc as i32)
+        })
     }
 
     /// Only the `[name]` of a depot file ("" when it has none), kept for the session: the
@@ -133,7 +185,7 @@ impl Hof {
                 "name" => h.name = r.str().to_string(),
                 "servicetrip" => h.service_trip = r.str().to_string(),
                 "global_strings" => {
-                    let n = r.usize();
+                    let n = r.count();
                     h.global_strings = (0..n).map(|_| r.str().to_string()).collect();
                 }
                 "addterminus" | "addterminus_allexit" => {
@@ -200,7 +252,7 @@ impl Hof {
                     // the list of the trip read last (0x7ea16f: DynArrayHigh of the trips);
                     // pushed as one more list, a trip without one (the IVU data routes of
                     // some depot files) gave every later trip the stops of the one before
-                    let n = r.usize();
+                    let n = r.count();
                     let list: Vec<String> = (0..n).map(|_| r.str().to_string()).collect();
                     if let Some(last) = h.info_busstop_lists.last_mut() {
                         *last = list;
@@ -216,6 +268,24 @@ impl Hof {
     pub fn terminus_by_code(&self, code: i32) -> Option<&Terminus> {
         self.termini.iter().find(|t| t.code == code)
     }
+}
+
+fn shared_hofs() -> Arc<[PathBuf]> {
+    static SHARED: std::sync::OnceLock<std::sync::Mutex<(u64, Arc<[PathBuf]>)>> = std::sync::OnceLock::new();
+    let cell = SHARED.get_or_init(Default::default);
+    let generation = omsi_cfg::content_generation();
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.0 != generation {
+        let mut seen = std::collections::HashSet::new();
+        let mut shared: Vec<PathBuf> = omsi_cfg::read_dir_merged("HOFs")
+            .into_iter()
+            .filter(|p| p.extension().map(|e| e.eq_ignore_ascii_case("hof")).unwrap_or(false))
+            .filter(|p| seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()))
+            .collect();
+        shared.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+        *guard = (generation, Arc::from(shared));
+    }
+    Arc::clone(&guard.1)
 }
 
 /// The `.hof` files available to a vehicle. Files next to the vehicle come first, merged
@@ -237,14 +307,11 @@ pub fn depot_files(dir: &Path) -> Vec<PathBuf> {
     }
     local.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
 
-    let mut shared: Vec<PathBuf> = omsi_cfg::read_dir_merged("HOFs")
-        .into_iter()
-        .filter(|p| p.extension().map(|e| e.eq_ignore_ascii_case("hof")).unwrap_or(false))
-        .filter(|p| seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()))
-        .collect();
-    shared.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
-
-    local.extend(shared);
+    for p in shared_hofs().iter() {
+        if seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()) {
+            local.push(p.clone());
+        }
+    }
     local
 }
 
@@ -315,7 +382,7 @@ pub fn depot_like(dir: &Path, hints: &[&str]) -> Option<Hof> {
     closest_name(&refs, hints).and_then(|i| Hof::load(&files[i]).ok())
 }
 
-/// The depot file called `name` in the shared `HOFs/` folder or any vehicle folder of any content root (`Vehicles/*/`).
+/// The depot file called `name` in the shared `HOFs/` folder, any map folder (`maps/*/`) or any vehicle folder (`Vehicles/*/`) of any content root.
 ///
 /// A depot file belongs to a map, not to a bus model: it lists the map's termini, stops and
 /// IBIS codes. A mod bus brings only the depot of the map it was made on (the O530 Citaro
@@ -341,9 +408,13 @@ pub fn depot_anywhere(name: &str) -> Option<Hof> {
     if let Some(path) = known {
         return path.and_then(|p| Hof::load(&p).ok());
     }
-    // every vehicle folder once over all roots (depot_in looks at each root's copy)
-    let mut dirs: Vec<PathBuf> = omsi_cfg::read_dir_merged("Vehicles").into_iter().filter(|d| omsi_cfg::vfs::is_dir(d)).collect();
-    dirs.sort_by_key(|d| d.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+    let sorted = |folder: &str| {
+        let mut dirs: Vec<PathBuf> = omsi_cfg::read_dir_merged(folder).into_iter().filter(|d| omsi_cfg::vfs::is_dir(d)).collect();
+        dirs.sort_by_key(|d| d.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+        dirs
+    };
+    let mut dirs = sorted("maps");
+    dirs.extend(sorted("Vehicles"));
     let h = dirs.iter().find_map(|d| depot_in(d, name));
     found.lock().unwrap_or_else(|e| e.into_inner()).1.insert(key, h.as_ref().map(|h| h.path.clone()));
     h
@@ -351,6 +422,81 @@ pub fn depot_anywhere(name: &str) -> Option<Hof> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn free_text_is_a_destination_of_its_own() {
+        let hof = Hof {
+            string_count_terminus: 3,
+            termini: vec![
+                Terminus { code: 12, texture_id: "Rathaus".into(), strings: vec!["Rathaus".into(), "Spandau".into(), "Rathaus".into()], ..Default::default() },
+                Terminus { code: 40, texture_id: "Hbf".into(), strings: vec!["Hbf".into()], ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let (one, i) = hof.with_free_text(["Sonderfahrt", " Betriebshof "]);
+        assert_eq!(i, 2);
+        assert_eq!(one.termini[2].strings, ["Sonderfahrt", "Betriebshof", "Sonderfahrt"]);
+        assert_eq!(one.termini[2].code, 41);
+        assert_eq!(one.termini[2].menu_name(), FREE_TEXT);
+        // typed again: the same destination changed, not another one added
+        let (two, j) = one.with_free_text(["", ""]);
+        assert_eq!((j, two.termini.len(), two.termini[2].code), (2, 3, 41));
+        assert!(two.termini[2].strings.iter().all(|s| s.is_empty()));
+        assert_eq!(two.termini[..2], hof.termini[..]);
+    }
+
+    #[test]
+    fn a_depot_file_carries_a_line_by_its_trip_codes_or_names() {
+        let trip = |code: &str, name: &str| InfoTrip { code: code.into(), name: name.into(), ..Default::default() };
+        let global = Hof { info_trips: vec![trip("1101", "11 -> PETIT VILTAIN"), trip("1401", "14 -> MOULON")], ..Default::default() };
+        let inter = Hof { info_trips: vec![trip("001", "91.06A -> MASSY GARE"), trip("005", "91.06C -> MASSY GARE")], ..Default::default() };
+        assert!(global.has_line("11-11s") && global.has_line("14"));
+        assert!(!global.has_line("1") && !global.has_line("91.06C") && !global.has_line(""));
+        assert!(inter.has_line("91.06C") && inter.has_line("91.06") && !inter.has_line("11-11s"));
+    }
+
+    #[test]
+    fn encoded_prefixed_lines_find_their_routes() {
+        let trip = |code: &str, name: &str, route: &str, line: &str| InfoTrip {
+            code: code.into(),
+            name: name.into(),
+            route: route.into(),
+            line: line.into(),
+            ..Default::default()
+        };
+        let hof = Hof {
+            termini: vec![
+                Terminus {
+                    code: 712,
+                    texture_id: "Birkenweg".into(),
+                    strings: vec!["Birkenweg".into()],
+                    ..Default::default()
+                },
+                Terminus {
+                    code: 154,
+                    texture_id: "S+U Rathaus Spandau".into(),
+                    strings: vec!["S+U Rathaus Spandau".into()],
+                    ..Default::default()
+                },
+            ],
+            info_trips: vec![
+                trip("1501", "Day 15 -> Birkenweg", "712", "15"),
+                trip("91502", "Birkenweg", "712", "915"),
+                trip("93402", "Spandau", "154", "934"),
+                trip("53402", "Kladow", "154", ""),
+                trip("4101", "Hbf", "154", "41"),
+                trip("101", "91.06A -> MASSY GARE", "154", "1"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(routes_to(&hof, "N15", &[712]), vec![1]);
+        assert_eq!(routes_to(&hof, "N34", &[154]), vec![2]);
+        assert_eq!(routes_to(&hof, "X34", &[154]), vec![3]);
+        assert_eq!(routes_to(&hof, "M41", &[154]), Vec::<usize>::new());
+        assert_eq!(routes_to(&hof, "91", &[154]), Vec::<usize>::new());
+        assert!(hof.has_line("N15") && hof.has_line("N34") && hof.has_line("X34"));
+        assert!(!hof.has_line("M41"));
+    }
+
     use super::*;
 
     /// #896: the bus's own depot of the map's place, not the first of its folder.
@@ -400,6 +546,37 @@ mod tests {
     }
 
     #[test]
+    fn a_depot_kept_in_its_map_folder_is_found() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("openomsi-map-hof-{stamp}"));
+        let map = root.join("maps/Moulon");
+        std::fs::create_dir_all(&map).unwrap();
+        std::fs::write(map.join(format!("company-{stamp}.hof")), format!("[name]\nCompany {stamp}\n")).unwrap();
+
+        omsi_cfg::add_content_root(root.clone());
+        let found = depot_anywhere(&format!("Company {stamp}")).map(|h| h.path);
+        omsi_cfg::remove_content_root(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(map.join(format!("company-{stamp}.hof"))));
+    }
+
+    #[test]
+    fn depot_name_prefers_file_stem_over_shared_internal_name() {
+        let dir = std::env::temp_dir().join(format!("openomsi-hof-stem-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HOF1.hof"), "[name]\nShared\n").unwrap();
+        std::fs::write(dir.join("HOF2.hof"), "[name]\nShared\n").unwrap();
+        let h2 = Hof::load(&dir.join("HOF2.hof")).unwrap();
+        assert_eq!(h2.depot_name(), "HOF2");
+        let picked = depot_in(&dir, &h2.depot_name()).unwrap();
+        assert_eq!(picked.path, dir.join("HOF2.hof"));
+        let memory_only = Hof { name: "Fallback".into(), ..Default::default() };
+        assert_eq!(memory_only.depot_name(), "Fallback");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn terminus_list_columns() {
         let text = "stringcount_terminus\r\n3\r\n\r\n[addterminus_list]\r\n{ALLEX}\t13\tBetriebsfahrt\tBETRIEBSFAHRT\t\tBETRIEBSFAHRT\t\t\r\n\t282\tU Ruhleben\tRUHLEBEN\tU-BAHNHOF\tRUHLEBEN  \t\t\t\r\n[end]\r\n";
         let h = Hof::parse(&CfgFile::from_str("test.hof", text));
@@ -425,9 +602,46 @@ mod tests {
     }
 
     #[test]
-    fn normal_hof_menu_name_keeps_display_text() {
+    fn numeric_hof_menu_name_uses_the_ident() {
         let t = Terminus { texture_id: "910".into(), strings: vec!["AEC".into()], ..Default::default() };
-        assert_eq!(t.menu_name(), "AEC");
+        assert_eq!(t.menu_name(), "910");
+        assert_eq!(t.display_name(), "AEC");
+    }
+
+    #[test]
+    fn menu_names_do_not_use_matrix_text_or_empty_destination_markers() {
+        let t = Terminus { texture_id: " Matrix check ".into(), strings: vec!["###".into(), "M A T R I X".into()], ..Default::default() };
+        assert_eq!(t.menu_name(), "Matrix check");
+        assert_eq!(t.display_name(), "###");
+
+        let empty = Terminus { code: 0, texture_id: "empty".into(), all_exit: true, strings: vec!["A".into()], ..Default::default() };
+        assert_eq!(empty.menu_name(), "empty");
+        assert_eq!(empty.strings, vec!["A"]);
+    }
+
+    #[test]
+    fn unnamed_hof_menu_entry_falls_back_to_display_text() {
+        let t = Terminus { strings: vec!["".into(), "Fallback".into()], ..Default::default() };
+        assert_eq!(t.menu_name(), "Fallback");
+    }
+
+    #[test]
+    fn destination_names_and_blank_displays_survive_both_hof_formats() {
+        // Synthetic records: both formats keep a destination whose display is blank.
+        let records = [
+            "[addterminus_allexit]\n0\nempty\n\n\n\n\n\n[addterminus_allexit]\n505\nMatrix check\n###\nM A T R I X\nCHECK\nx\nMC\n",
+            "[addterminus_list]\n{ALLEX}\t0\tempty\t\t\t\t\t\n{ALLEX}\t505\tMatrix check\t###\tM A T R I X\tCHECK\tx\tMC\n[end]\n",
+        ];
+        for records in records {
+            let h = Hof::parse(&CfgFile::from_str("menu.hof", &format!("stringcount_terminus\n5\n{records}")));
+            assert_eq!(h.termini.len(), 2);
+            let empty = &h.termini[0];
+            assert_eq!((empty.code, empty.menu_name(), empty.all_exit), (0, "empty".into(), true));
+            assert_eq!(empty.strings, vec![""; 5]);
+            let check = &h.termini[1];
+            assert_eq!((check.code, check.menu_name()), (505, "Matrix check".into()));
+            assert_eq!(check.strings, vec!["###", "M A T R I X", "CHECK", "x", "MC"]);
+        }
     }
 
     #[test]
@@ -452,4 +666,227 @@ mod tests {
         assert!(h.info_busstop_lists[1].is_empty());
         assert_eq!(h.info_busstop_lists[2], vec!["Hauptbahnhof", "Markt", "Bergerfuerth"]);
     }
+}
+
+/// A timetable's terminus is a stop name, while a HOF often uses a shorter
+/// destination/texture name for the same stop (Berlin 5E: `Spektefeld
+/// Schulzentrum` vs. `Spektefeld`).  Exact matches remain preferred; the
+/// boundary-aware prefix fallback handles those stock abbreviations without
+/// making unrelated destinations match. The name a row goes by (its ident, its stop, the
+/// first line of its sign) counts before another of its lines that reads the same: the
+/// district line of Spandau's Machandelweg reads RUHLEBEN, the sign of U Ruhleben, and
+/// U Ruhleben by its sign text (what a LAN player's bus says it shows) was Machandelweg.
+pub fn terminus_match_score(t: &Terminus, wanted: &str) -> u8 {
+    let wanted = wanted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if wanted.is_empty() {
+        return 0;
+    }
+    let shown = t.strings.iter().position(|s| !s.trim().is_empty());
+    let mut score = 0;
+    for (k, candidate) in std::iter::once(t.texture_id.as_str())
+        .chain(std::iter::once(t.terminus_stop.as_deref().unwrap_or("")))
+        .chain(t.strings.iter().map(String::as_str))
+        .enumerate()
+    {
+        let candidate = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+        let candidate_lower = candidate.to_lowercase();
+        let wanted_lower = wanted.to_lowercase();
+        if candidate_lower == wanted_lower {
+            score = score.max(if k < 2 || Some(k - 2) == shown { 3 } else { 2 });
+        } else if wanted_lower.starts_with(&(candidate_lower.clone() + " ")) {
+            score = score.max(1);
+        } else if candidate_lower.starts_with(&(wanted_lower + " ")) {
+            score = score.max(1);
+        }
+    }
+    score
+}
+
+/// Every row of the depot file a trip's destination names, in file order: those whose
+/// ident is the name, else those of the best looser match. A depot file may give one
+/// destination a row per route, each with a code of its own (four "ul. Xutorskaya" of
+/// codes 92, 120, 123 and 124, #738).
+pub fn termini_named(hof: &Hof, wanted: &str) -> Vec<usize> {
+    let exact = wanted.trim();
+    let rows: Vec<usize> = (0..hof.termini.len()).filter(|&i| hof.termini[i].texture_id == exact).collect();
+    if !rows.is_empty() {
+        return rows;
+    }
+    let scores: Vec<u8> = hof.termini.iter().map(|t| terminus_match_score(t, wanted)).collect();
+    let best = scores.iter().copied().max().unwrap_or(0);
+    (0..scores.len()).filter(|&i| best > 0 && scores[i] == best).collect()
+}
+
+/// The depot file's terminus a trip of `line` to `terminus` through `stops` ends at, and
+/// the route it takes ([`pick_route`]): of the rows of that name (see [`termini_named`]) the
+/// one the line's route through the trip's stops leads to. Taking the first of them, the
+/// IBIS got the first's code, a route of the line to it or none at all, whichever route
+/// the trip drove (line 39 to "ul. Xutorskaya" typed destination 92, where its route ends
+/// at 120). The first row when no route of the line goes to any of them.
+pub fn trip_terminus(
+    hof: &Hof,
+    line: &str,
+    terminus: &str,
+    stops: &[&str],
+) -> Option<(usize, Option<usize>)> {
+    let rows = termini_named(hof, terminus);
+    let first = *rows.first()?;
+    let mut codes: Vec<i32> = Vec::new();
+    for &i in &rows {
+        if !codes.contains(&hof.termini[i].code) {
+            codes.push(hof.termini[i].code);
+        }
+    }
+    let route = pick_route(hof, &routes_to(hof, line, &codes), stops);
+    let ti = route
+        .map(|r| omsi_cfg::parse_i32(&hof.info_trips[r].route))
+        .and_then(|code| rows.iter().copied().find(|&i| hof.termini[i].code == code))
+        .unwrap_or(first);
+    Some((ti, route))
+}
+
+fn encoded_hof_line(line: &str) -> Option<u32> {
+    let s = line.trim();
+    let mut chars = s.chars();
+    let prefix = chars.next().filter(|c| c.is_ascii_alphabetic())?.to_ascii_uppercase();
+    let rest = chars.as_str();
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let num = rest.parse::<u32>().ok().filter(|&n| n < 100)?;
+    match prefix {
+        'N' => Some(900 + num),
+        'X' => Some(500 + num),
+        _ => None,
+    }
+}
+
+/// The depot file's routes of `line` to a terminus with one of `codes`, in file order. The
+/// route code is the line's number and two digits: a driver types those, whatever the
+/// route's line string says (Grundorf's 7601 to Krankenhaus has "TML").
+pub fn routes_to(hof: &Hof, line: &str, codes: &[i32]) -> Vec<usize> {
+    let trimmed = line.trim();
+    let line_digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let line_number = line_digits.parse::<u32>().ok();
+    let encoded = encoded_hof_line(trimmed);
+    hof.info_trips
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            if !codes.contains(&omsi_cfg::parse_i32(&t.route)) {
+                return false;
+            }
+            let hof_line = t
+                .line
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .or_else(|| t.code.trim().parse::<u32>().ok().map(|c| c / 100));
+            t.line.trim().eq_ignore_ascii_case(trimmed)
+                || (!line_digits.is_empty() && t.line.trim() == line_digits)
+                || (line_number.is_some()
+                    && t.code.trim().parse::<u32>().ok().map(|c| c / 100) == line_number)
+                || encoded.is_some_and(|enc| hof_line == Some(enc))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Which of `routes` a trip through `stops` (the timetable's station names) runs: one
+/// starting at the trip's first stop (the IBIS starts its count there), of those the one
+/// that has most of the trip's stops in the trip's order, then the one as long as the trip
+/// (a short working's route rather than the long one it is part of). Nothing in the
+/// timetable ties a trip to a route of the depot file - a driver picks it by its stops -
+/// and a line often has several routes to one terminus; taking the first whose first stop
+/// was spelt as the timetable spells it typed the wrong one whenever the spellings
+/// differed. None without routes; the first route when no stop matches any.
+pub fn pick_route(hof: &Hof, routes: &[usize], stops: &[&str]) -> Option<usize> {
+    let trip: Vec<(String, Vec<String>)> = stops
+        .iter()
+        .map(|s| (s.trim().to_lowercase(), stop_words(s)))
+        .filter(|(s, _)| !s.is_empty())
+        .collect();
+    let mut best: Option<(usize, (bool, usize, std::cmp::Reverse<usize>))> = None;
+    for &r in routes {
+        let list = hof
+            .info_busstop_lists
+            .get(r)
+            .map(|l| l.as_slice())
+            .unwrap_or(&[]);
+        let names: Vec<Vec<(String, Vec<String>)>> =
+            list.iter().map(|id| ident_names(hof, id)).collect();
+        // the longest common subsequence: a stop missing on either side costs nothing
+        // but itself, and a stop the route lists twice is not
+        // matched past the rest of the trip
+        let mut row = vec![0usize; names.len() + 1];
+        for t in &trip {
+            let mut diag = 0;
+            for (j, n) in names.iter().enumerate() {
+                let up = row[j + 1];
+                row[j + 1] = if same_stop(n, t) { diag + 1 } else { up.max(row[j]) };
+                diag = up;
+            }
+        }
+        let found = row[names.len()];
+        let starts = match (trip.first(), names.first()) {
+            (Some(t), Some(n)) => same_stop(n, t),
+            _ => false,
+        };
+        let score = (
+            starts,
+            found,
+            std::cmp::Reverse(names.len().abs_diff(stops.len())),
+        );
+        if best.as_ref().is_none_or(|(_, b)| score > *b) {
+            best = Some((r, score));
+        }
+    }
+    match best {
+        Some((r, (_, found, _))) if found > 0 => Some(r),
+        _ => routes.first().copied(),
+    }
+}
+
+/// The names a stop of a route's list goes by: its ident (before a `#`) and the strings
+/// the depot file's `[addbusstop]` of that ident gives it, each lowercased and as its
+/// [`stop_words`].
+pub fn ident_names(hof: &Hof, ident: &str) -> Vec<(String, Vec<String>)> {
+    let ident = ident.split('#').next().unwrap_or("").trim();
+    let mut names = vec![ident.to_string()];
+    for b in &hof.bus_stops {
+        if b.ident.trim().eq_ignore_ascii_case(ident) {
+            names.extend(b.strings.iter().map(|s| s.trim().to_string()));
+        }
+    }
+    names
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .map(|n| (n.to_lowercase(), stop_words(&n)))
+        .collect()
+}
+
+/// One stop of a route (its [`ident_names`]) and a timetable stop (lowercased, and its
+/// [`stop_words`]) are the same: a name equal, one the start of the other, or the same
+/// words.
+pub fn same_stop(names: &[(String, Vec<String>)], stop: &(String, Vec<String>)) -> bool {
+    names.iter().any(|(raw, words)| {
+        !raw.is_empty()
+            && (*raw == stop.0
+            || raw.starts_with(&stop.0)
+            || stop.0.starts_with(raw.as_str())
+            || (!words.is_empty() && *words == stop.1))
+    })
+}
+
+/// A stop name as the set of its words, so that the map's and the depot file's spellings
+/// of one stop meet: in any order ("Nordstadt Bhf", "Bhf Nordstadt"), with any punctuation
+/// ("Bhf. Nordstadt") and without one-letter prefixes ("F_Kirchweg", "Kirchweg").
+pub fn stop_words(name: &str) -> Vec<String> {
+    let mut w: Vec<String> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() > 1)
+        .map(|w| w.to_lowercase())
+        .collect();
+    w.sort();
+    w
 }

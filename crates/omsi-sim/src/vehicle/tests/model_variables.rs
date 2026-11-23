@@ -1,0 +1,655 @@
+use super::*;
+
+fn diagnostic_vehicle(reverse: bool) -> VehicleInstance {
+    VehicleInstance::new(
+        Arc::new(diagnostic_type(reverse)),
+        VehicleHost::new(Default::default()),
+    )
+}
+
+fn diagnostic_type(reverse: bool) -> VehicleType {
+    let mut declared = vec!["unwritten", "selection", "initialised"];
+    if reverse {
+        declared.reverse();
+    }
+    let seed = crate::timetable_run::tests::script_test_vehicle(
+        "{init}\n1 (S.L.selection) (S.L.initialised)\n{end}\n",
+        &declared.join("\n"),
+        "",
+    );
+    let mut blocks = vec!["[mesh]\nfixed.o3d\n".to_string()];
+    for value in 0..=2 {
+        for (id, variable) in [
+            ("unique", format!("missing_{value}")),
+            ("shared", "missing_shared".to_string()),
+            ("declared", "unwritten".to_string()),
+        ] {
+            blocks.push(format!(
+                "[mesh]\n{id}{value}.o3d\n[visible]\n{variable}\n{value}\n"
+            ));
+        }
+        let material = |id: &str, visible: &str, variable: &str| {
+            format!(
+                "[mesh]\n{id}{value}.o3d\n{visible}[matl_change]\nlamp.png\n0\n{variable}\n[matl_item]\n[matl_nightmap]\nlamp_on.png\n"
+            )
+        };
+        let variable = format!("missing_material_{value}");
+        blocks.push(material(
+            "combined",
+            &format!("[visible]\n{variable}\n{value}\n"),
+            &variable,
+        ));
+        blocks.push(material("monitor", "", &variable));
+        blocks.push(material(
+            "declared_material",
+            &format!("[visible]\nunwritten\n{value}\n"),
+            "unwritten",
+        ));
+    }
+    blocks.push("[mesh]\nmaterial_only.o3d\n[matl_change]\nlamp.png\n0\nmissing_material_only\n[matl_item]\n[matl_nightmap]\nlamp_on.png\n".to_string());
+    blocks.push("[mesh]\ninitialised.o3d\n[visible]\ninitialised\n1\n[matl_change]\nlamp.png\n0\ninitialised\n[matl_item]\n[matl_nightmap]\nlamp_on.png\n".to_string());
+    for value in [1, 4, 0] {
+        blocks.push(format!(
+            "[mesh]\nselector{value}.o3d\n[visible]\nselection\n{value}\n"
+        ));
+    }
+    if reverse {
+        blocks.reverse();
+    }
+    let mut ty = (*seed.ty).clone();
+    ty.model = Model::parse(&omsi_cfg::CfgFile::from_str(
+        "diagnostic.cfg",
+        &blocks.join("\n"),
+    ));
+    ty.meshes = (0..ty.model.meshes.len())
+        .map(|def_index| VehicleMesh {
+            def_index,
+            data: MeshData::default(),
+            file: PathBuf::new(),
+            materials: vec![omsi_o3d::Material {
+                texture: "lamp.png".into(),
+                ..Default::default()
+            }],
+            overrides: ty.model.meshes[def_index].materials.clone(),
+            pivot: Mat4::IDENTITY,
+            viewpoint: 0,
+            skin: Vec::new(),
+            keep_winding: false,
+        })
+        .collect();
+    ty
+}
+
+/// Original OMSI 2 runtime diagnostic: distinct and shared missing names ignore
+/// comparisons 0/1/2; declared, unwritten names compare zero. Reversing model and
+/// varlist order does not change those results. No original vehicle assets needed.
+#[test]
+fn missing_visibility_names_are_distinct_from_declared_zero() {
+    for reverse in [false, true] {
+        let mut v = diagnostic_vehicle(reverse);
+        v.update_visuals(0.0);
+        assert_eq!(v.var("unwritten"), Some(0.0));
+        assert_eq!(v.var("initialised"), Some(1.0));
+        for name in ["missing_0", "missing_1", "missing_2", "missing_shared"] {
+            assert_eq!(v.var(name), None, "model must not register {name}");
+        }
+        for (i, mesh) in v.ty.model.meshes.iter().enumerate() {
+            let expected = if mesh.file.starts_with("declared") {
+                mesh.file.ends_with("0.o3d")
+            } else if mesh.file.starts_with("selector") {
+                mesh.file == "selector1.o3d"
+            } else {
+                true
+            };
+            assert_eq!(v.mesh_props[i].visible, expected, "{}", mesh.file);
+        }
+        let reference = compute_mesh_props(&v.ty, &|name| v.var(name));
+        for (actual, expected) in v.mesh_props.iter().zip(reference) {
+            assert_eq!(actual.visible, expected.visible);
+            assert_eq!(actual.slot_night, expected.slot_night);
+        }
+    }
+}
+
+#[test]
+fn a_missing_visibility_name_does_not_activate_its_material_variant() {
+    let mut v = diagnostic_vehicle(false);
+    v.update_visuals(0.0);
+    for (i, mesh) in v.ty.model.meshes.iter().enumerate() {
+        if mesh.file.starts_with("combined")
+            || mesh.file.starts_with("monitor")
+            || mesh.file == "material_only.o3d"
+        {
+            assert!(v.mesh_props[i].visible, "{}", mesh.file);
+            assert_eq!(v.mesh_props[i].slot_night, [0.0], "{}", mesh.file);
+            let variable = &mesh.materials[0].change.as_ref().unwrap().2;
+            assert_eq!(v.var(variable), None);
+        }
+        if mesh.file == "initialised.o3d" {
+            assert!(v.mesh_props[i].visible);
+            assert_eq!(v.mesh_props[i].slot_night, [1.0]);
+        }
+    }
+}
+
+#[test]
+fn scripted_selector_transitions_leave_missing_materials_at_base() {
+    let mut v = diagnostic_vehicle(false);
+    for selection in [1.0, 4.0, 1.0, 0.0, 1.0, 4.0, 1.0, 0.0] {
+        assert!(v.set_var("SELECTION", selection));
+        for _ in 0..3 {
+            v.update_visuals(1.0 / 30.0);
+            let active: Vec<_> =
+                v.ty.model
+                    .meshes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| m.file.starts_with("selector") && v.mesh_props[*i].visible)
+                    .map(|(_, m)| m.file.as_str())
+                    .collect();
+            assert_eq!(active, [format!("selector{selection}.o3d")]);
+            for (i, mesh) in v.ty.model.meshes.iter().enumerate() {
+                if mesh.file.starts_with("combined") {
+                    assert!(v.mesh_props[i].visible);
+                    assert_eq!(v.mesh_props[i].slot_night, [0.0]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_engine_variable_registered_later_rebinds_visibility_and_materials() {
+    let mut v = diagnostic_vehicle(false);
+    v.update_visuals(0.0);
+    v.set_engine_var("MISSING_MATERIAL_1", 0.0);
+    v.update_visuals(0.0);
+    let combined =
+        v.ty.model
+            .meshes
+            .iter()
+            .position(|m| m.file == "combined1.o3d")
+            .unwrap();
+    let monitor =
+        v.ty.model
+            .meshes
+            .iter()
+            .position(|m| m.file == "monitor1.o3d")
+            .unwrap();
+    assert!(!v.mesh_props[combined].visible);
+    assert!(v.mesh_props[monitor].visible);
+    assert_eq!(v.mesh_props[monitor].slot_night, [0.0]);
+    assert!(v.set_var("missing_material_1", 1.0));
+    v.update_visuals(0.0);
+    assert!(v.mesh_props[combined].visible);
+    assert_eq!(v.mesh_props[monitor].slot_night, [1.0]);
+}
+
+#[test]
+fn a_setvar_on_a_model_only_name_switches_its_meshes() {
+    let shown = |v: &VehicleInstance| -> Vec<String> {
+        v.ty.model
+            .meshes
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| m.file.starts_with("shared") && v.mesh_props[*i].visible)
+            .map(|(_, m)| m.file.clone())
+            .collect()
+    };
+    let mut v = diagnostic_vehicle(false);
+    assert!(v.set_var("MISSING_SHARED", 2.0));
+    v.update_visuals(0.0);
+    assert_eq!(shown(&v), ["shared2.o3d"]);
+    assert!(!v.set_var("not_in_the_model", 1.0));
+
+    let mut ty = diagnostic_type(false);
+    ty.paint_schemes = vec![PaintScheme {
+        set_vars: vec![("Missing_Shared".into(), 1.0)],
+        ..Default::default()
+    }];
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    v.update_visuals(0.0);
+    assert_eq!(shown(&v), ["shared1.o3d"]);
+}
+
+/// A scheme's `[setvar]` wins over a script that writes the same variable every frame: the
+/// Kajosoft Jelcz's `cockpit_frame` sets `v_drzwi` from its constant (0) and its repaints
+/// choose the glazed doors with `[setvar] v_drzwi 1`, which Omsi.exe draws (#3183). The
+/// scripts still see the scheme's value when they start, as before.
+#[test]
+fn a_schemes_setvar_is_what_is_drawn_after_the_scripts() {
+    let dir =
+        std::env::temp_dir().join(format!("omsi_scheme_after_scripts_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("cockpit.osc");
+    std::fs::write(
+        &script,
+        "{frame}\n(L.L.v_drzwi) (S.L.seen)\n0 (S.L.v_drzwi)\n{end}\n",
+    )
+    .unwrap();
+    let vars = dir.join("vars.txt");
+    std::fs::write(&vars, "v_drzwi\nseen\n").unwrap();
+    let program = omsi_script::compile(&omsi_script::CompileInput {
+        scripts: vec![script],
+        varlists: vec![vars],
+        ..Default::default()
+    });
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(program.errors.is_empty(), "{:?}", program.errors);
+    let mut ty = diagnostic_type(false);
+    ty.program = Arc::new(program);
+    ty.paint_schemes = vec![PaintScheme {
+        set_vars: vec![("v_drzwi".into(), 1.0)],
+        ..Default::default()
+    }];
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    v.update(1.0 / 30.0);
+    assert_eq!(v.var("v_drzwi"), Some(1.0), "drawn: the scheme's value");
+    assert_eq!(
+        v.var("seen"),
+        Some(1.0),
+        "the scripts started with the scheme's value"
+    );
+    // a switch pressed: the scripts run alone, and the scheme's value is kept again
+    v.update_scripts_only(0.0);
+    assert_eq!(v.var("v_drzwi"), Some(1.0));
+}
+
+/// The variables the player chose for the bus before it was made - the launcher's onboard
+/// computer, the IBIS unit the pack's repaints name (#4077) - are there for the scripts'
+/// `{init}`, which reads the unit's type to build its keys and its display, and they stay over
+/// the scheme's `[setvar]` of them every frame, as `--setvar` does after the spawn.
+#[test]
+fn a_variable_chosen_before_the_bus_is_made_is_there_for_init() {
+    let dir = std::env::temp_dir().join(format!("omsi_initial_vars_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ibis.osc");
+    std::fs::write(&script, "{init}\n(L.L.vis_ibis_type) (S.L.at_init)\n{end}\n{frame}\n(L.L.vis_ibis_type) (S.L.drawn)\n0 (S.L.vis_ibis_type)\n{end}\n").unwrap();
+    let vars = dir.join("vars.txt");
+    std::fs::write(&vars, "vis_ibis_type\nat_init\ndrawn\n").unwrap();
+    let program = omsi_script::compile(&omsi_script::CompileInput {
+        scripts: vec![script],
+        varlists: vec![vars],
+        ..Default::default()
+    });
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(program.errors.is_empty(), "{:?}", program.errors);
+    let mut ty = diagnostic_type(false);
+    ty.program = Arc::new(program);
+    ty.paint_schemes = vec![PaintScheme {
+        set_vars: vec![("vis_ibis_type".into(), 0.0)],
+        ..Default::default()
+    }];
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    host.initial_vars = vec![("vis_ibis_type".into(), 2.0)];
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    assert_eq!(
+        v.var("at_init"),
+        Some(2.0),
+        "the scripts started with the unit the player picked"
+    );
+    v.update(1.0 / 30.0);
+    assert_eq!(v.var("drawn"), Some(2.0));
+    assert_eq!(
+        v.var("vis_ibis_type"),
+        Some(2.0),
+        "and the paint's own value does not take it back"
+    );
+}
+
+/// A value asked for with `--setvar` stays over the scheme's `[setvar]` of the same variable,
+/// which is written every frame: the launcher's doors and mirrors chosen over a repaint's
+/// were the repaint's again a frame later, and only what the repaint does not set was the
+/// player's. What the scheme does not set is still the scripts' to change.
+#[test]
+fn a_value_set_over_the_scheme_stays_the_one_set() {
+    let dir = std::env::temp_dir().join(format!("omsi_scheme_override_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("cockpit.osc");
+    std::fs::write(
+        &script,
+        "{frame}\n(L.L.v_doors) (S.L.seen)\n(L.L.lamp) 1 + (S.L.lamp)\n{end}\n",
+    )
+    .unwrap();
+    let vars = dir.join("vars.txt");
+    std::fs::write(&vars, "v_doors\nv_mirrors\nseen\nlamp\n").unwrap();
+    let program = omsi_script::compile(&omsi_script::CompileInput {
+        scripts: vec![script],
+        varlists: vec![vars],
+        ..Default::default()
+    });
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(program.errors.is_empty(), "{:?}", program.errors);
+    let mut ty = diagnostic_type(false);
+    ty.program = Arc::new(program);
+    ty.paint_schemes = vec![PaintScheme {
+        set_vars: vec![("v_doors".into(), 1.0), ("v_mirrors".into(), 1.0)],
+        ..Default::default()
+    }];
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    v.apply_paint_vars(Some(0));
+    assert!(
+        v.set_var_over_scheme("V_Doors", 0.0),
+        "the spelling does not matter"
+    );
+    assert!(v.set_var_over_scheme("lamp", 10.0));
+    assert!(!v.set_var_over_scheme("not_in_the_model", 1.0));
+    for _ in 0..3 {
+        v.update(1.0 / 30.0);
+    }
+    assert_eq!(
+        v.var("v_doors"),
+        Some(0.0),
+        "the value set, not the scheme's"
+    );
+    assert_eq!(v.var("seen"), Some(0.0), "the scripts see the value set");
+    assert_eq!(
+        v.var("v_mirrors"),
+        Some(1.0),
+        "what was not set over it is the scheme's"
+    );
+    assert_eq!(
+        v.var("lamp"),
+        Some(13.0),
+        "a variable the scheme does not set is the scripts'"
+    );
+    v.update_scripts_only(0.0);
+    assert_eq!(v.var("v_doors"), Some(0.0));
+}
+
+#[test]
+fn a_repaint_lets_go_of_what_the_last_livery_set() {
+    let dir = std::env::temp_dir().join(format!("omsi_repaint_release_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("init.osc");
+    std::fs::write(&script, "{init}\n3 (S.L.v_font)\n{end}\n").unwrap();
+    let vars = dir.join("vars.txt");
+    std::fs::write(&vars, "v_font\nv_door\nv_seat\n").unwrap();
+    let program = omsi_script::compile(&omsi_script::CompileInput {
+        scripts: vec![script],
+        varlists: vec![vars],
+        ..Default::default()
+    });
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(program.errors.is_empty(), "{:?}", program.errors);
+    let mut ty = diagnostic_type(false);
+    ty.program = Arc::new(program);
+    ty.paint_schemes = vec![
+        PaintScheme {
+            name: "A".into(),
+            set_vars: vec![("v_font".into(), 7.0), ("v_seat".into(), 2.0)],
+            ..Default::default()
+        },
+        PaintScheme {
+            name: "B".into(),
+            set_vars: vec![("v_door".into(), 1.0)],
+            ..Default::default()
+        },
+    ];
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    assert!(v.set_var_over_scheme("v_seat", 5.0));
+    v.update(1.0 / 30.0);
+    assert_eq!((v.var("v_font"), v.var("v_seat")), (Some(7.0), Some(5.0)));
+    v.repaint(Some(1));
+    v.update(1.0 / 30.0);
+    assert_eq!(
+        v.var("v_font"),
+        Some(3.0),
+        "B does not set it: back to what a new bus has"
+    );
+    assert_eq!(v.var("v_door"), Some(1.0));
+    assert_eq!(v.var("v_seat"), Some(5.0), "the player's own value stays");
+    assert_eq!(v.var("Colorscheme"), Some(1.0));
+    v.repaint(None);
+    v.update(1.0 / 30.0);
+    assert_eq!(
+        (v.var("v_font"), v.var("v_door")),
+        (Some(3.0), Some(0.0)),
+        "the default paint: nothing of A or B"
+    );
+    assert_eq!(v.var("Colorscheme"), Some(-1.0));
+}
+
+#[test]
+fn a_livery_changed_puts_back_what_the_old_one_set() {
+    let painted = |init: &str| {
+        let mut ty =
+            (*crate::timetable_run::tests::script_test_vehicle(init, "v_drzwi\nv_font\n", "").ty)
+                .clone();
+        ty.paint_schemes = vec![
+            PaintScheme {
+                set_vars: vec![("v_drzwi".into(), 1.0), ("V_Font".into(), 7.0)],
+                ..Default::default()
+            },
+            PaintScheme::default(),
+        ];
+        Arc::new(ty)
+    };
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(painted("{init}\n3 (S.L.v_font)\n{end}\n"), host);
+    v.apply_paint_vars(Some(0));
+    let car = painted("{init}\n5 (S.L.v_font)\n{end}\n");
+    v.attach_trailer(car.clone());
+    v.trailers[0].run = Some(Box::new(crate::vehicle::car_run::CarRun::start(
+        &car,
+        &mut v,
+        [1.0, 0.0, 0.0],
+        &mut Vec::new(),
+    )));
+    assert_eq!((v.var("v_drzwi"), v.var("v_font")), (Some(1.0), Some(7.0)));
+    assert_eq!(v.trailers[0].run_var("v_font"), Some(7.0));
+    for (scheme, drzwi, font, car_font) in [
+        (Some(1), 0.0, 3.0, 5.0),
+        (Some(0), 1.0, 7.0, 7.0),
+        (None, 0.0, 3.0, 5.0),
+    ] {
+        v.repaint(scheme);
+        v.update(1.0 / 30.0);
+        assert_eq!(
+            (v.var("v_drzwi"), v.var("v_font")),
+            (Some(drzwi), Some(font)),
+            "{scheme:?}"
+        );
+        assert_eq!(
+            v.trailers[0].run_var("v_font"),
+            Some(car_font),
+            "{scheme:?}"
+        );
+    }
+}
+
+#[test]
+fn a_livery_let_go_of_gives_back_this_buss_own_init_value() {
+    let mut ty = (*crate::timetable_run::tests::script_test_vehicle(
+        "{init}\n(L.$.yard) $length (S.L.v_font)\n{end}\n",
+        "v_font\n",
+        "yard\n",
+    )
+    .ty)
+        .clone();
+    ty.paint_schemes = vec![
+        PaintScheme {
+            set_vars: vec![("v_font".into(), 7.0)],
+            ..Default::default()
+        },
+        PaintScheme::default(),
+    ];
+    let mut host = VehicleHost::new(Default::default());
+    host.hof = Some(Arc::new(omsi_vehicle::hof::Hof {
+        name: "Lichtenberg".into(),
+        ..Default::default()
+    }));
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    v.apply_paint_vars(Some(0));
+    assert_eq!(v.var("v_font"), Some(7.0));
+    for scheme in [Some(1), None] {
+        v.repaint(scheme);
+        v.update(1.0 / 30.0);
+        assert_eq!(
+            v.var("v_font"),
+            Some(11.0),
+            "{scheme:?}: the length of this bus's yard, not a new bus's"
+        );
+    }
+}
+
+#[test]
+fn a_repaint_leaves_alone_what_neither_livery_sets() {
+    let mut ty = (*crate::timetable_run::tests::script_test_vehicle(
+        "{init}\n7 (S.L.v_font)\n{end}\n",
+        "ass_select_tone\nv_font\n",
+        "",
+    )
+    .ty)
+        .clone();
+    let pdo = PaintScheme {
+        name: "PDO_1828".into(),
+        set_vars: vec![("ASS_select_tone".into(), 2.0), ("v_font".into(), 7.0)],
+        ..Default::default()
+    };
+    let tan = |n: &str| PaintScheme {
+        name: n.into(),
+        ..Default::default()
+    };
+    ty.paint_schemes = vec![pdo, tan("TAN_619"), tan("TAN_746")];
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(Arc::new(ty), host);
+    v.apply_paint_vars(Some(0));
+    v.repaint(Some(1));
+    assert_eq!(
+        (v.var("ASS_select_tone"), v.var("v_font")),
+        (Some(0.0), Some(7.0)),
+        "{{init}} wrote the livery's own value"
+    );
+    assert!(v.set_var("ASS_select_tone", 4.0));
+    v.repaint(Some(2));
+    v.update(1.0 / 30.0);
+    assert_eq!(
+        v.var("ASS_select_tone"),
+        Some(4.0),
+        "the player's tone: neither TAN livery sets it"
+    );
+}
+
+#[test]
+fn a_coupled_car_lets_go_of_the_value_it_took_from_the_painted_bus() {
+    let painted = |init: &str| {
+        let mut ty =
+            (*crate::timetable_run::tests::script_test_vehicle(init, "v_drzwi\n", "").ty).clone();
+        ty.paint_schemes = vec![
+            PaintScheme {
+                set_vars: vec![("v_drzwi".into(), 1.0)],
+                ..Default::default()
+            },
+            PaintScheme::default(),
+        ];
+        Arc::new(ty)
+    };
+    let mut host = VehicleHost::new(Default::default());
+    host.paint_scheme = Some(Some(0));
+    let mut v = VehicleInstance::new(painted(""), host);
+    v.apply_paint_vars(Some(0));
+    let car = painted("{frame}\n(L.L.v_drzwi) (S.L.v_drzwi)\n{end}\n");
+    v.attach_trailer(car.clone());
+    v.trailers[0].run = Some(Box::new(crate::vehicle::car_run::CarRun::start(
+        &car,
+        &mut v,
+        [1.0, 0.0, 0.0],
+        &mut Vec::new(),
+    )));
+    assert_eq!(v.trailers[0].run_var("v_drzwi"), Some(1.0));
+    for scheme in [Some(1), None] {
+        v.repaint(scheme);
+        v.update(1.0 / 30.0);
+        assert_eq!(
+            (v.var("v_drzwi"), v.trailers[0].run_var("v_drzwi")),
+            (Some(0.0), Some(0.0)),
+            "{scheme:?}"
+        );
+    }
+}
+
+#[test]
+fn animation_only_variable_binds_and_animates_without_script_declaration() {
+    let seed = crate::timetable_run::tests::script_test_vehicle("", "", "");
+    let mut ty = (*seed.ty).clone();
+    let cfg = "[mesh]\ntimetable.o3d\n[newanim]\norigin_rot_y\n90\nanim_trans\nsched\n0.1\n";
+    ty.model = Model::parse(&omsi_cfg::CfgFile::from_str("test.cfg", cfg));
+    ty.meshes.push(VehicleMesh {
+        def_index: 0,
+        data: Default::default(),
+        file: "timetable.o3d".into(),
+        materials: vec![],
+        overrides: vec![],
+        pivot: glam::Mat4::IDENTITY,
+        viewpoint: 0,
+        skin: vec![],
+        keep_winding: false,
+    });
+    let mut v = VehicleInstance::new(Arc::new(ty), VehicleHost::new(Default::default()));
+    assert_eq!(v.var("sched"), None, "lazy before set");
+    assert_eq!(
+        v.animators[0].anims[0].2.var, None,
+        "animator var unbound before set"
+    );
+    v.update_visuals(0.0);
+    assert_eq!(v.mesh_transforms[0], glam::Mat4::IDENTITY);
+
+    assert!(v.set_var("sched", 1.0));
+    assert_eq!(v.var("sched"), Some(1.0));
+    assert_ne!(
+        v.animators[0].anims[0].2.var, None,
+        "animator bound to variable"
+    );
+    v.update_visuals(0.0);
+    assert_ne!(v.mesh_transforms[0], glam::Mat4::IDENTITY);
+}
+
+#[test]
+fn multiple_animation_only_variables_bind_and_animate_together() {
+    let seed = crate::timetable_run::tests::script_test_vehicle("", "", "");
+    let mut ty = (*seed.ty).clone();
+    let cfg = "[mesh]\ntimetable_bracket.o3d\n[newanim]\norigin_rot_y\n90\nanim_trans\nsched\n0.1\n\n[mesh]\ntimetable_sheet.o3d\n[newanim]\norigin_rot_x\n45\nanim_rot\nsched1\n90\n";
+    ty.model = Model::parse(&omsi_cfg::CfgFile::from_str("test.cfg", cfg));
+    for (i, name) in ["timetable_bracket.o3d", "timetable_sheet.o3d"]
+        .iter()
+        .enumerate()
+    {
+        ty.meshes.push(VehicleMesh {
+            def_index: i,
+            data: Default::default(),
+            file: (*name).into(),
+            materials: vec![],
+            overrides: vec![],
+            pivot: glam::Mat4::IDENTITY,
+            viewpoint: 0,
+            skin: vec![],
+            keep_winding: false,
+        });
+    }
+    let mut v = VehicleInstance::new(Arc::new(ty), VehicleHost::new(Default::default()));
+    assert_eq!(v.var("sched"), None);
+    assert_eq!(v.var("sched1"), None);
+    assert_eq!(v.animators[0].anims[0].2.var, None);
+    assert_eq!(v.animators[1].anims[0].2.var, None);
+
+    assert!(v.set_var("sched", 1.0));
+    assert!(v.set_var("sched1", 1.0));
+    assert_ne!(v.animators[0].anims[0].2.var, None);
+    assert_ne!(v.animators[1].anims[0].2.var, None);
+    v.update_visuals(0.0);
+    assert_ne!(v.mesh_transforms[0], glam::Mat4::IDENTITY);
+    assert_ne!(v.mesh_transforms[1], glam::Mat4::IDENTITY);
+}

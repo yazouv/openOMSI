@@ -11,13 +11,27 @@ Thanks for helping! A few rules keep the project healthy:
 * `cargo test --workspace` and `cargo build --release` must pass (CI checks all platforms).
 * Code style: `rustfmt` defaults, comments explain *why*.
 
+## Pull requests
+
+1. Work on a branch of your own (of your fork), never on `main`, and open a pull request
+   against `main`. Unfinished work can be opened as a draft.
+2. Fill in the template: what the player notices, how to test it, before/after screenshots
+   if anything changes on screen (launcher or game), what could break.
+3. The checks run on every push, and test builds for Windows, macOS, Linux and Android are
+   linked in a comment, so anyone can try the change before it is merged.
+4. One maintainer other than the author approves it, and it is merged. Some parts need a
+   second review: see [GOVERNANCE.md](GOVERNANCE.md).
+5. Once merged, it is in the next **beta** a maintainer publishes, and players get it with the
+   next stable release.
+
 The full checklist a pull request is measured against is in
 [DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md).
 
 ## Files and licences
 
-* **Contributions are MIT**, like the rest of the code and documentation. The few
-  third-party files the game ships (the Roboto fonts, the Material icons with their
+* **New contributions are AGPL-3.0-only**, like the project license in `LICENSE`.
+  Historical MIT notices are retained, and earlier MIT releases keep their terms. The few
+  third-party files the game ships (the Inter fonts, the Material icons with their
   `LICENSE.txt`) keep their own licences; adding another - map data from OpenStreetMap
   (ODbL), CC-BY-SA pictures, other fonts or icon sets - needs the maintainers' agreement
   first. A format can be documented here and its real data published elsewhere (a release,
@@ -31,8 +45,14 @@ The full checklist a pull request is measured against is in
 ## Translations
 
 The interface texts are in [`crates/omsi-app/locales/app.yml`](crates/omsi-app/locales/app.yml),
-with the English text as the key. A pull request that changes it is checked automatically:
+the English reference, with the English text as the key. Each language has its own file beside
+it, `app.<language>.yml` (`app.de.yml`, `app.pt-pt.yml`, ...), one line `"English": "translation"`
+per text. A new text goes into app.yml and into every language's file; texts a language lacked
+before may stay missing for now (`cargo test -p omsi-launcher-core --test translations -- --ignored`
+lists them). `cargo test -p omsi-launcher-core --test translations` fails on a translation of a text
+app.yml does not have. A pull request that changes the translations is checked automatically:
 
+* a new text in app.yml must be translated in every `app.<language>.yml`;
 * add or correct texts of your language; keep the placeholders (`%{packs}`, `{}`) of the key;
 * do not remove a key or reword the English one - the code looks texts up by it;
 * changing another contributor's existing translation is fine when it is a correction - say
@@ -45,7 +65,7 @@ with the English text as the key. A pull request that changes it is checked auto
   opens again by itself once it is edited into English. Logs and game text can stay as
   they are.
 * One problem or idea per issue, on the latest release. Questions go to the
-  [Discord server](https://discord.gg/VG2EKVafYG).
+  [Discord server](https://discord.gg/openomsi).
 * New issues are sorted automatically: the form's "What is it about?" becomes an `area:`
   label and the issue gets a first milestone (a regression or a crash: v0.1.x), which the
   maintainers move when it fits better elsewhere. A crash report with the same panic as an
@@ -59,5 +79,9 @@ See the layout in the [README](README.md#repository-layout) and
 
 ## Releases
 
-Maintainers bump `MAJOR.MINOR` in the `VERSION` file; everything else is automatic - see
+A maintainer publishes `main` as a **beta** (a GitHub pre-release) for testers; players only
+get **stable** releases, which are betas the maintainers have tested and promoted, about once
+a week. A published release is never
+replaced: a fix is a new version. Maintainers bump `MAJOR.MINOR` in the `VERSION` file (in a
+pull request), publish betas and promote them; everything else is automatic - see
 [docs/VERSIONING.md](docs/VERSIONING.md).

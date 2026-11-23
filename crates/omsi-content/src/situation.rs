@@ -11,13 +11,28 @@ pub struct SituationVehicle {
     /// w; Direct3D frame, y up) and three more (0 for a standing vehicle). Nine slots.
     pub orientation: [f64; 9],
     pub tile: (i32, i32),
-    pub id: f64,
+    /// Total odometer kilometres, after the tile coordinates: Omsi.exe 0x64207E writes
+    /// the starting reading plus the distance driven, and 0x643DF3 restores it.
+    pub odometer_km: f64,
     pub paint: String,
     pub coupled_with: Option<i32>,
     pub is_my_vehicle: bool,
     pub vars: Vec<(String, f64)>,
     pub string_vars: Vec<(String, String)>,
     pub timetable: Vec<String>,
+    pub riders: usize,
+    /// The coupled cars that run scripts of their own (a tram's rear cab), each with its
+    /// own variables (`[openOMSI_car]`; Omsi.exe keeps one set for the whole train).
+    pub cars: Vec<SituationCar>,
+}
+
+/// One coupled car's own script variables in a saved vehicle (see `SituationVehicle::cars`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SituationCar {
+    /// Its place among the vehicle's coupled parts (0: the first behind the leading one).
+    pub car: usize,
+    pub vars: Vec<(String, f64)>,
+    pub string_vars: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -25,6 +40,7 @@ pub struct Situation {
     pub path: PathBuf,
     pub name: String,
     pub description: String,
+    pub name_chosen: bool,
     pub map: String,
     pub weather: Option<String>,
     /// year, day of year, hour, minute, second
@@ -38,11 +54,16 @@ pub struct Situation {
     pub vehicles: Vec<SituationVehicle>,
 }
 
+pub const NAME_CHOSEN: &str = "[openomsi_name_chosen]";
+
 impl Situation {
     /// Write the situation the way OMSI does (UTF-16 LE with a BOM, CR LF).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut t = String::new();
         t.push_str(&format!("[name]\r\n{}\r\n", self.name));
+        if self.name_chosen {
+            t.push_str(&format!("{NAME_CHOSEN}\r\n"));
+        }
         t.push_str(&format!("[description]\r\n{}\r\n[end]\r\n\r\n", self.description));
         t.push_str(&format!("[map]\r\n{}\r\n\r\n", self.map));
         if let Some(w) = &self.weather {
@@ -75,12 +96,15 @@ impl Situation {
             for k in 0..7 {
                 t.push_str(&format!("{:.3}\r\n", v.orientation[k]));
             }
-            t.push_str(&format!("{}\r\n{}\r\n{:.3}\r\n{}\r\n", v.tile.0, v.tile.1, v.id, v.paint));
+            t.push_str(&format!("{}\r\n{}\r\n{:.3}\r\n{}\r\n", v.tile.0, v.tile.1, v.odometer_km, v.paint));
             if let Some(c) = v.coupled_with {
                 t.push_str(&format!("\r\n[coupledWith]\r\n{c}\r\n"));
             }
             if v.is_my_vehicle {
                 t.push_str("\r\n[ismyVehicle]\r\n");
+            }
+            if v.riders > 0 {
+                t.push_str(&format!("\r\n[openOMSI_riders]\r\n{}\r\n", v.riders));
             }
             t.push_str(&format!("\r\n[vars]\r\n{}\r\n", v.vars.len()));
             for (n, x) in &v.vars {
@@ -89,6 +113,16 @@ impl Situation {
             t.push_str(&format!("\r\n[stringvars]\r\n{}\r\n", v.string_vars.len()));
             for (n, x) in &v.string_vars {
                 t.push_str(&format!("{n}\r\n{x}\r\n"));
+            }
+            for c in &v.cars {
+                t.push_str(&format!("\r\n[openOMSI_car]\r\n{}\r\n{}\r\n", c.car, c.vars.len()));
+                for (n, x) in &c.vars {
+                    t.push_str(&format!("{n}\r\n{x:.6}\r\n"));
+                }
+                t.push_str(&format!("{}\r\n", c.string_vars.len()));
+                for (n, x) in &c.string_vars {
+                    t.push_str(&format!("{n}\r\n{x}\r\n"));
+                }
             }
             if !v.timetable.is_empty() {
                 t.push_str("\r\n[settimetable]\r\n");
@@ -112,6 +146,7 @@ impl Situation {
         while let Some(k) = r.next_keyword() {
             match k.as_str() {
                 "name" => s.name = r.str().to_string(),
+                "openomsi_name_chosen" => s.name_chosen = true,
                 "description" => s.description = r.until("[end]").join("\n"),
                 "map" => s.map = r.str().to_string(),
                 "actuweather" => s.weather = Some(r.str().to_string()),
@@ -132,9 +167,9 @@ impl Situation {
                         *v = r.f64();
                     }
                     let tile = (r.i32(), r.i32());
-                    let id = r.f64();
+                    let odometer_km = r.f64();
                     let paint = r.str().to_string();
-                    s.vehicles.push(SituationVehicle { file, pos, orientation, tile, id, paint, ..Default::default() });
+                    s.vehicles.push(SituationVehicle { file, pos, orientation, tile, odometer_km, paint, ..Default::default() });
                 }
                 "coupledwith" => {
                     let v = r.i32();
@@ -147,8 +182,14 @@ impl Situation {
                         veh.is_my_vehicle = true;
                     }
                 }
-                "vars" => {
+                "openomsi_riders" => {
                     let n = r.usize();
+                    if let Some(veh) = s.vehicles.last_mut() {
+                        veh.riders = n;
+                    }
+                }
+                "vars" => {
+                    let n = r.count();
                     let mut vars = Vec::with_capacity(n);
                     for _ in 0..n {
                         let name = r.str().to_string();
@@ -160,7 +201,7 @@ impl Situation {
                     }
                 }
                 "stringvars" => {
-                    let n = r.usize();
+                    let n = r.count();
                     let mut vars = Vec::with_capacity(n);
                     for _ in 0..n {
                         let name = r.str().to_string();
@@ -169,6 +210,15 @@ impl Situation {
                     }
                     if let Some(veh) = s.vehicles.last_mut() {
                         veh.string_vars = vars;
+                    }
+                }
+                "openomsi_car" => {
+                    let car = r.usize();
+                    let vars = (0..r.count()).map(|_| (r.str().to_string(), r.f64())).collect();
+                    let string_vars =
+                        (0..r.count()).map(|_| (r.str().to_string(), r.line().to_string())).collect();
+                    if let Some(veh) = s.vehicles.last_mut() {
+                        veh.cars.push(SituationCar { car, vars, string_vars });
                     }
                 }
                 "settimetable" => {
@@ -189,12 +239,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn situation_round_trips_padded_device_strings_and_duty_identity() {
+    fn situation_round_trips_padded_device_strings_duty_identity_and_riders() {
         let path =
             std::env::temp_dir().join(format!("omsi_situation_strings_{}.osn", std::process::id()));
         let sit = Situation {
             vehicles: vec![SituationVehicle {
                 file: "Vehicles/Test.bus".into(),
+                odometer_km: 75556.639,
                 vars: vec![("power".into(), 1.0)],
                 string_vars: vec![
                     ("line".into(), " 109  ".into()),
@@ -204,13 +255,22 @@ mod tests {
                 timetable: ["109", "65104", "16", "7", "0", "0"]
                     .map(String::from)
                     .to_vec(),
+                riders: 23,
+                cars: vec![SituationCar {
+                    car: 1,
+                    vars: vec![("cabin_active".into(), 1.0), ("power".into(), 0.0)],
+                    string_vars: vec![("destination".into(), "  Depot  ".into())],
+                }],
                 ..Default::default()
             }],
+            name: "Slot 3: Depot run, 09:00".into(),
+            name_chosen: true,
             ..Default::default()
         };
         sit.save(&path).unwrap();
         let loaded = Situation::load(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(loaded.vehicles, sit.vehicles);
+        assert_eq!((loaded.name.as_str(), loaded.name_chosen), ("Slot 3: Depot run, 09:00", true));
     }
 }

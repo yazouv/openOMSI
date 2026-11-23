@@ -1,17 +1,30 @@
 # Builds openOMSI for Windows and Linux (x64, ARM64), macOS (Apple silicon, Intel) and Android
-# (plus the dedicated server for Linux and Windows) on every push to
-# main and publishes them as the release v<MAJOR.MINOR.COMMIT>; see docs/VERSIONING.md.
-# Pull requests run the same builds without publishing.
+# (plus the dedicated server for Linux and Windows) when a maintainer runs it from main
+# (Actions -> Release -> Run workflow) and publishes them as the beta (pre-release)
+# v<MAJOR.MINOR.PATCH>; promote.yml makes a tested beta the stable release. A push to main
+# builds every platform and publishes nothing. See docs/VERSIONING.md.
+# Pull requests build Windows x64, macOS (Apple silicon), Linux x64 and Android, without publishing;
+# the label ci:all-platforms builds all seven (from the next push or run).
 name: Release
 
 on:
+  pull_request:
+    paths-ignore: ["docs/**", "site/**", "*.md"]
   push:
     branches: [main]
-  pull_request:
+    paths-ignore: ["docs/**", "site/**", "*.md"]
   workflow_dispatch:
+    # (a beta of one platform alone, to test a fix only that platform needs; a published
+    # release keeps its files, so the others never join it, and it cannot be promoted)
+    inputs:
+      only:
+        description: Platform to build and release alone
+        type: choice
+        default: all
+        options: [all, windows, macos, linux, android]
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The builds (and the actions they use) only read the repository; `release` alone writes,
@@ -37,36 +50,38 @@ jobs:
         env:
           PR: ${{ github.event.pull_request.number }}
         run: echo "version=$(sh scripts/version.sh)${PR:+-pr$PR}" >> "$GITHUB_OUTPUT"
-      - run: echo "### openOMSI ${{ steps.v.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+      - env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: echo "### openOMSI $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
   windows:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'all' || inputs.only == 'windows' }}
+    timeout-minutes: 90
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            arch: x64
-          # ARM64 (Snapdragon laptops): built on the x64 runner with its ARM64 tools
-          - target: aarch64-pc-windows-msvc
-            arch: arm64
+        # ARM64 (Snapdragon laptops): built on the x64 runner with its ARM64 tools
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci:all-platforms') && '["x64"]' || '["x64", "arm64"]') }}
     env:
       OPENOMSI_VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.arch == 'arm64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ env.TARGET }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-      - name: Workspace regression tests
-        if: matrix.arch == 'x64'
-        run: cargo test --locked --workspace --no-fail-fast
+          key: ${{ env.TARGET }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            launcher/src-tauri -> target
       - name: Build
         shell: cmd
-        run: scripts\build-windows.cmd ${{ matrix.target }}
+        run: scripts\build-windows.cmd %TARGET%
       # Microsoft's shader compiler for DirectX 12 (dxcompiler.dll, dxil.dll beside the
       # program): without it wgpu falls back to the old FXC, which is slow and refuses
       # some of the game's shaders. DirectX 12 is the way round a Vulkan driver that fails.
@@ -82,6 +97,80 @@ jobs:
           $arch = if ("${{ matrix.arch }}" -eq "arm64") { "arm64" } else { "x64" }
           Copy-Item "dxc/x/bin/$arch/dxcompiler.dll", "dxc/x/bin/$arch/dxil.dll" dist/windows/
           Get-ChildItem dist/windows
+      # Google's ANGLE (OpenGL ES over Direct3D 11) for the "ANGLE (DirectX 11)" graphics API:
+      # libEGL.dll and libGLESv2.dll built from ANGLE's own source by
+      # openOMSI-org/angle-openomsi, taken by its release tag and checked against the
+      # SHA-256 recorded here (and the DLLs against the release's own SHA256SUMS). x64 only:
+      # there is no ARM64 build, and the game skips the option without the DLLs.
+      - name: ANGLE (DirectX 11)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANGLE_TAG: angle-8091-36b74e4dd4
+          ANGLE_SHA256: 1c0086155a17445110dd97400018ca6e72ea245ef178989b457720ee1fba3af5
+        run: |
+          gh release download $env:ANGLE_TAG -R openOMSI-org/angle-openomsi --pattern "*-windows-x64.zip" -D angle
+          $zip = Get-ChildItem angle/*.zip | Select-Object -First 1
+          $have = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          if ($have -ne $env:ANGLE_SHA256) { throw "ANGLE zip: SHA-256 $have, expected $env:ANGLE_SHA256" }
+          Expand-Archive $zip.FullName -DestinationPath angle/x
+          $dir = Get-ChildItem angle/x -Directory | Select-Object -First 1
+          foreach ($line in Get-Content (Join-Path $dir.FullName "SHA256SUMS")) {
+            $want, $name = $line -split '\s+\*?', 2
+            $got = (Get-FileHash (Join-Path $dir.FullName $name) -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $want.ToLower()) { throw "ANGLE ${name}: SHA-256 $got, expected $want" }
+          }
+          Copy-Item (Join-Path $dir.FullName "libEGL.dll"), (Join-Path $dir.FullName "libGLESv2.dll"), (Join-Path $dir.FullName "LICENSE-ANGLE.txt") dist/windows/
+          Get-ChildItem dist/windows
+      # NVIDIA DLSS is NOT bundled in any openOMSI release. A player may
+      # download the official SDK explicitly through the Windows launcher.
+      # The AMD FidelityFX binaries below retain their own MIT terms.
+      # The four specific signed FidelityFX SDK 2.4.0 DLLs below are explicitly
+      # MIT-licensed exceptions in the pinned SDK's Kits/FidelityFX/docs/license.md.
+      # Keep the exact file allowlist, upstream license and third-party notices.
+      - name: AMD FidelityFX SDK 2.4.0 (FSR 3, x64; MIT-listed DLLs)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          git init -q ffx
+          git -C ffx remote add origin https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+          git -C ffx sparse-checkout set --no-cone /Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll /Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll /Kits/FidelityFX/signedbin/amd_fidelityfx_loader_vk.dll /Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll /Kits/FidelityFX/docs/license.md /3rdpartynotice.md
+          git -C ffx fetch -q --depth 1 origin 7539ae8b6568ad29ed78a753404351daf3b5cca7
+          git -C ffx checkout -q FETCH_HEAD
+          if ((git -C ffx rev-parse HEAD) -ne '7539ae8b6568ad29ed78a753404351daf3b5cca7') { throw 'FidelityFX SDK commit mismatch' }
+          $files = @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll')
+          $licence = Get-Content ffx/Kits/FidelityFX/docs/license.md -Raw
+          $mitSection = $licence.IndexOf('These source files')
+          $mitGrant = $licence.IndexOf('are subject to the following license:', $mitSection)
+          if ($mitSection -lt 0 -or $mitGrant -lt 0 -or $licence.Substring($mitGrant) -notmatch 'Permission is hereby granted') { throw 'FidelityFX MIT exception section missing' }
+          foreach ($file in $files) {
+            $entry = 'Kits\FidelityFX\signedbin\' + $file
+            if ($licence.Substring($mitSection, $mitGrant - $mitSection) -notlike ('*' + $entry + '*')) { throw "Not explicitly MIT-licensed: $file" }
+            $signed = Get-AuthenticodeSignature (Join-Path ffx/Kits/FidelityFX/signedbin $file)
+            if ($signed.Status -ne 'Valid' -or $signed.SignerCertificate.Subject -notmatch '(^|, )O=Advanced Micro Devices(,|$)') { throw "AMD signature of ${file}: $($signed.Status)" }
+            Copy-Item (Join-Path ffx/Kits/FidelityFX/signedbin $file) dist/windows/
+          }
+          Copy-Item ffx/Kits/FidelityFX/docs/license.md dist/windows/LICENSE-FidelityFX.md
+          Copy-Item ffx/3rdpartynotice.md dist/windows/THIRD-PARTY-FidelityFX.md
+          $note = @(
+            'These four DLLs are listed as MIT-licensed exceptions in the pinned AMD FidelityFX SDK 2.4.0 license:',
+            'amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll,',
+            'amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll',
+            'Original SDK commit: 7539ae8b6568ad29ed78a753404351daf3b5cca7',
+            'Full license: LICENSE-FidelityFX.md (MIT grant is near the end)',
+            'Additional upstream third-party notices: THIRD-PARTY-FidelityFX.md'
+          ) -join "`n"
+          Set-Content -Path dist/windows/FidelityFX-BINARIES-NOTICE.txt -Value $note -Encoding UTF8
+          Get-ChildItem dist/windows/amd_fidelityfx_*.dll | Select-Object Name,Length
+      - name: ANGLE DirectX 11 startup regression (WARP)
+        if: matrix.arch == 'x64' && github.event_name == 'pull_request'
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          ANGLE_TEST_LIBRARY_DIRECTORY: ${{ github.workspace }}/dist/windows
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p omsi-render --test angle_startup -- --ignored --nocapture
       # The Visual C++ runtime beside the program (Microsoft allows it to be shipped
       # app-locally): without it a PC lacking the Redistributable refused to start the game
       # ("VCRUNTIME140_1.dll was not found"). It cannot be linked in instead - the OpenXR
@@ -104,70 +193,128 @@ jobs:
           Copy-Item README.md, LICENSE dist/windows/
           Compress-Archive -Path dist/windows/* -DestinationPath "out/$name.zip"
           # the dedicated server for Windows (Server 2016 and later): the same program
-          # started with --server, and start.cmd
+          # started with --server, start.cmd, and run-server.cmd that asks for the folder,
+          # the settings and the map
           New-Item -ItemType Directory -Force dist/server | Out-Null
-          Copy-Item dist/windows/openomsi.exe, dist/windows/vcruntime140.dll, dist/windows/vcruntime140_1.dll, dist/windows/msvcp140.dll, scripts/server/start.cmd, LICENSE dist/server/
+          Copy-Item dist/windows/openomsi.exe, dist/windows/vcruntime140.dll, dist/windows/vcruntime140_1.dll, dist/windows/msvcp140.dll, scripts/server/start.cmd, scripts/server/run-server.cmd, scripts/server/run-server.ps1, LICENSE dist/server/
           # (Steam's library: the x64 program does not start without it beside it)
           if (Test-Path dist/windows/steam_api64.dll) { Copy-Item dist/windows/steam_api64.dll dist/server/ }
           Copy-Item docs/SERVER.md dist/server/README.md
           New-Item -ItemType File -Force dist/server/.openomsi-content | Out-Null
           Compress-Archive -Path dist/server/* -DestinationPath "out/openOMSI-$env:OPENOMSI_VERSION-server-windows-${{ matrix.arch }}.zip"
+      - name: Installer
+        shell: bash
+        run: |
+          export PATH="/c/Program Files (x86)/NSIS:$PATH"
+          for i in 1 2 3 4 5; do
+            command -v makensis >/dev/null && break
+            choco install nsis -y --no-progress || sleep 30
+          done
+          sh scripts/windows/make-installer.sh dist/windows "out/openOMSI-$OPENOMSI_VERSION-windows-${{ matrix.arch }}-setup.exe"
+      - name: Installer install and uninstall
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\openOMSI"
+          $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\openOMSI.lnk"
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\openOMSI"
+          Start-Process -Wait "out/openOMSI-$env:OPENOMSI_VERSION-windows-x64-setup.exe" -ArgumentList "/S", "/D=$dir"
+          foreach ($p in "$dir\openomsi.exe", "$dir\openomsi-launcher-app.exe", "$dir\uninstall.exe", $lnk, $key) {
+            if (-not (Test-Path $p)) { throw "the installer did not make $p" }
+          }
+          New-Item -ItemType Directory -Force "$dir\Mods\mine" | Out-Null
+          Set-Content "$dir\Mods\mine\keep.txt" "a player's mod"
+          Set-Content "$dir\later.dll" "a file an update brought"
+          Set-Content "$dir\openomsi.exe.old-update" "the version before"
+          Set-Content "$dir\.openomsi-files" "later.dll`nopenomsi.exe`n..`nMods`n"
+          Start-Process -Wait "$dir\uninstall.exe" -ArgumentList "/S", "_?=$dir"
+          foreach ($p in "$dir\openomsi.exe", "$dir\openomsi-launcher-app.exe", "$dir\later.dll", "$dir\openomsi.exe.old-update", "$dir\.openomsi-files", $lnk, $key) {
+            if (Test-Path $p) { throw "the uninstaller left $p" }
+          }
+          if (-not (Test-Path "$dir\Mods\mine\keep.txt")) { throw "the uninstaller deleted the player's mods" }
       - uses: actions/upload-artifact@v7
         with:
           # (a release keeps its files; a pull request's test builds are fetched within days)
           retention-days: 14
           name: windows-${{ matrix.arch }}
-          path: out/*.zip
+          path: |
+            out/*.zip
+            out/*.exe
+
+  windows-tests:
+    if: ${{ !inputs.only || inputs.only == 'all' || inputs.only == 'windows' }}
+    timeout-minutes: 90
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Workspace regression tests
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: cargo test --locked --workspace --no-fail-fast
 
   macos:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'all' || inputs.only == 'macos' }}
+    timeout-minutes: 90
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: aarch64-apple-darwin
-            arch: arm64
-          # Intel Macs: built on the Apple silicon runner for x86_64
-          - target: x86_64-apple-darwin
-            arch: x64
+        # Intel Macs: built on the Apple silicon runner for x86_64
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci:all-platforms') && '["arm64"]' || '["arm64", "x64"]') }}
     env:
       OPENOMSI_VERSION: ${{ needs.version.outputs.version }}
-      OPENOMSI_TARGET: ${{ matrix.target }}
+      OPENOMSI_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ env.OPENOMSI_TARGET }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ env.OPENOMSI_TARGET }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            launcher/src-tauri -> target
       - name: Build
         run: scripts/build-macos.sh
+      - name: iPhone and iPad game library compiles
+        if: matrix.arch == 'arm64'
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: '18.0'
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo check --locked -p omsi-app --lib --target aarch64-apple-ios
       - name: Package
         run: |
           mkdir -p out
           cp README.md LICENSE dist/macos/
-          cd dist/macos && ditto -c -k --sequesterRsrc . "../../out/openOMSI-$OPENOMSI_VERSION-macos-${{ matrix.arch }}.zip"
+          (cd dist/macos && ditto -c -k --sequesterRsrc . "../../out/openOMSI-$OPENOMSI_VERSION-macos-${{ matrix.arch }}.zip")
+          sh scripts/macos/make-dmg.sh dist/macos/openOMSI.app "out/openOMSI-$OPENOMSI_VERSION-macos-${{ matrix.arch }}.dmg"
       - uses: actions/upload-artifact@v7
         with:
           # (a release keeps its files; a pull request's test builds are fetched within days)
           retention-days: 14
           name: macos-${{ matrix.arch }}
-          path: out/*.zip
+          path: |
+            out/*.zip
+            out/*.dmg
 
   linux:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'all' || inputs.only == 'linux' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-22.04
-            arch: x64
-          - runner: ubuntu-22.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci:all-platforms') && '["x64"]' || '["x64", "arm64"]') }}
+    timeout-minutes: 90
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
     env:
       OPENOMSI_VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -184,17 +331,23 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            launcher/src-tauri -> target
       - name: System libraries
         run: |
           for i in 1 2 3; do
             sudo apt-get update && sudo apt-get install -y build-essential pkg-config libasound2-dev \
-              libudev-dev libgtk-3-dev libxkbcommon-dev libwayland-dev libssl-dev zip clang lld && break
+              libudev-dev libgtk-3-dev libxkbcommon-dev libwayland-dev libssl-dev libwebkit2gtk-4.1-dev zip clang lld && break
             sleep 20
           done
       - name: Workspace regression tests
         if: matrix.arch == 'x64'
         env:
           RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=lld"
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
         run: |
           cargo test --locked --workspace --no-fail-fast
           # (the tests' debug build is not needed for the release one: its room is)
@@ -229,6 +382,8 @@ jobs:
 
   android:
     needs: version
+    if: ${{ !inputs.only || inputs.only == 'all' || inputs.only == 'android' }}
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     env:
       OPENOMSI_VERSION: ${{ needs.version.outputs.version }}
@@ -245,6 +400,8 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-java@v6
         with:
           distribution: zulu
@@ -253,7 +410,20 @@ jobs:
         run: |
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$sdkmanager" --licenses >/dev/null || true
-          "$sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358" >/dev/null
+          # A failed/corrupt NDK ZIP download is transient on hosted runners.
+          # Retry the installation and clear incomplete archives between attempts.
+          for attempt in 1 2 3; do
+            if "$sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Android SDK installation failed after three attempts"
+              exit 1
+            fi
+            echo "::warning::Android SDK download failed (attempt $attempt/3), retrying"
+            rm -rf "$ANDROID_HOME/ndk/28.2.13676358" "$ANDROID_HOME/.temp"
+            sleep $((attempt * 10))
+          done
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
       - name: Build
         run: scripts/build-android.sh
@@ -261,6 +431,9 @@ jobs:
         run: |
           mkdir -p out
           cp "dist/android/openOMSI-$OPENOMSI_VERSION.apk" "out/openOMSI-$OPENOMSI_VERSION-android-arm64.apk"
+          # (and under a name of its own: releases/latest/download/openOMSI-android.apk is
+          # always the newest stable APK - for a phone whose installed build cannot update itself)
+          cp "dist/android/openOMSI-$OPENOMSI_VERSION.apk" "out/openOMSI-android.apk"
       - uses: actions/upload-artifact@v7
         with:
           # (a release keeps its files; a pull request's test builds are fetched within days)
@@ -269,8 +442,9 @@ jobs:
           path: out/*.apk
 
   release:
-    if: github.event_name != 'pull_request'
-    needs: [version, windows, macos, linux, android]
+    # (the platforms not built again are skipped, not failed)
+    if: ${{ !cancelled() && !failure() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs: [version, windows, windows-tests, macos, linux, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -285,55 +459,32 @@ jobs:
         with:
           path: out
           merge-multiple: true
-      - name: Publish v${{ needs.version.outputs.version }}
+      - name: Publish v${{ needs.version.outputs.version }} (beta)
         run: |
           ls -l out
-          # what changed: this version's section of CHANGELOG.md (up to the next version)
-          awk -v v="## $VERSION" 'index($0, v) == 1 && (length($0) == length(v) || substr($0, length(v) + 1, 1) == " ") {f = 1; next} f && /^## / {exit} f {print}' CHANGELOG.md > changes.md
-          # a release for every push: without a section of its own, what CHANGELOG.md gained
-          # since the previous release (the lines added, in their order)
-          if ! grep -q '[^[:space:]]' changes.md; then
-            prev=$(git tag -l 'v*' --sort=-v:refname | grep -vx "v$VERSION" | head -1)
-            if [ -n "$prev" ]; then
-              git diff --unified=0 "$prev" HEAD -- CHANGELOG.md | grep '^+' | grep -v '^+++' | sed 's/^+//' | grep -v '^## ' > changes.md || true
-            fi
+          if [ "$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "v$VERSION" --yes
           fi
-          if ! grep -q '[^[:space:]]' changes.md; then
-            echo "Small changes and fixes." > changes.md
-          fi
-          cat > notes.md <<NOTES
-          **openOMSI $VERSION**
-
-          > **Early release, expect bugs.** openOMSI needs an original OMSI 2 installation to run; it contains no game content.
-
-          NOTES
-          cat changes.md >> notes.md
-          cat >> notes.md <<NOTES
-
-          ### Downloads
-
-          | Platform | Download |
-          | --- | --- |
-          | Windows x64 | \`openOMSI-$VERSION-windows-x64.zip\` |
-          | Windows ARM64 | \`openOMSI-$VERSION-windows-arm64.zip\` |
-          | macOS (Apple silicon) | \`openOMSI-$VERSION-macos-arm64.zip\` |
-          | macOS (Intel) | \`openOMSI-$VERSION-macos-x64.zip\` |
-          | Linux x64 | \`openOMSI-$VERSION-linux-x64.zip\` |
-          | Linux ARM64 | \`openOMSI-$VERSION-linux-arm64.zip\` |
-          | Android (arm64, 8.0+) | \`openOMSI-$VERSION-android-arm64.apk\` |
-          | Dedicated server, Linux | \`openOMSI-$VERSION-server-linux-x64.zip\`, \`openOMSI-$VERSION-server-linux-arm64.zip\` |
-          | Dedicated server, Windows | \`openOMSI-$VERSION-server-windows-x64.zip\`, \`openOMSI-$VERSION-server-windows-arm64.zip\` |
-          NOTES
-          git tag -f "v$VERSION" "$GITHUB_SHA"
-          git push -f origin "v$VERSION"
           if gh release view "v$VERSION" >/dev/null 2>&1; then
-            # the same version built again (main was rewritten and pushed once more): the
-            # release stays, with this build's files and notes
-            gh release upload "v$VERSION" out/*.zip out/*.apk --clobber
-            gh release edit "v$VERSION" --title "openOMSI $VERSION" --notes-file notes.md
-          else
-            gh release create "v$VERSION" out/*.zip out/*.apk \
-              --verify-tag \
-              --title "openOMSI $VERSION" \
-              --notes-file notes.md
+            echo "::error::v$VERSION is already published and stays as it is: a fix is released as a new version"
+            exit 1
           fi
+          prev=$(git tag -l "v${VERSION%.*}.*" --sort=-v:refname | grep -vx "v$VERSION" | head -1)
+          if [ -n "$prev" ] && ! git merge-base --is-ancestor "$prev" "$GITHUB_SHA"; then
+            echo "::error::$GITHUB_SHA is older than $prev: only a newer commit of main is released"
+            exit 1
+          fi
+          if ! git tag "v$VERSION" "$GITHUB_SHA" 2>/dev/null && [ "$(git rev-parse "v$VERSION^{commit}")" != "$GITHUB_SHA" ]; then
+            echo "::error::the tag v$VERSION already names another commit"
+            exit 1
+          fi
+          git push origin "v$VERSION"
+          sh scripts/release-notes.sh "$VERSION" > notes.md
+          cd out
+          files=$(ls *.zip *.apk *.dmg *.exe 2>/dev/null || true)
+          sha256sum $files > SHA256SUMS
+          gh release create "v$VERSION" $files SHA256SUMS \
+            --verify-tag \
+            --prerelease \
+            --title "openOMSI $VERSION" \
+            --notes-file ../notes.md

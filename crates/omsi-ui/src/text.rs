@@ -1,8 +1,8 @@
-//! Roboto, the interface font (Apache 2.0), in several weights of its variable font.
+//! Inter, the interface font (SIL Open Font Licence 1.1), in several weights of its variable font.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, VariableFont};
 
-const ROBOTO: &[u8] = include_bytes!("../../../assets/fonts/Roboto-VariableFont_wdth,wght.ttf");
+const INTER: &[u8] = include_bytes!("../../../assets/fonts/InterVariable.ttf");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Weight {
@@ -10,19 +10,20 @@ pub enum Weight {
     Medium,
     Bold,
     Black,
-    /// Bold and narrow (Roboto's `wdth` 75): figures in a tight space.
+    /// Semi-bold, a little narrower than bold: figures in a tight space (Inter has no width
+    /// axis, so this is a lighter weight rather than a narrow one).
     Condensed,
 }
 
 impl Weight {
     const ALL: [Weight; 5] = [Weight::Regular, Weight::Medium, Weight::Bold, Weight::Black, Weight::Condensed];
-    fn axes(self) -> (f32, f32) {
+    fn wght(self) -> f32 {
         match self {
-            Weight::Regular => (400.0, 100.0),
-            Weight::Medium => (500.0, 100.0),
-            Weight::Bold => (700.0, 100.0),
-            Weight::Black => (900.0, 100.0),
-            Weight::Condensed => (700.0, 75.0),
+            Weight::Regular => 400.0,
+            Weight::Medium => 500.0,
+            Weight::Bold => 700.0,
+            Weight::Black => 900.0,
+            Weight::Condensed => 600.0,
         }
     }
 }
@@ -37,7 +38,7 @@ pub struct Bitmap {
     pub ascent: f32,
 }
 
-/// A character Roboto has in place of one it has not (a box would show).
+/// A character Inter has in place of one it has not (a box would show).
 fn substitute(c: char) -> char {
     match c {
         '→' | '▸' | '➜' | '⟶' | '►' | '▶' => '›',
@@ -46,12 +47,14 @@ fn substitute(c: char) -> char {
         '⚠' => '!',
         '✓' | '✔' => '•',
         '✕' | '✖' => '×',
+        // every kind of dash and the raised dot: a plain hyphen
+        '‐' | '‑' | '‒' | '–' | '—' | '―' | '−' | '⸺' | '⸻' | '﹘' | '－' | '·' => '-',
         c => c,
     }
 }
 
 /// Letters written as a base and a combining mark (Unicode's decomposed form, which is how
-/// macOS stores file names: "Eiseska\u{308}lte.owt") as the one letter Roboto draws - the
+/// macOS stores file names: "Eiseska\u{308}lte.owt") as the one letter Inter draws - the
 /// mark alone was a box after a plain "a" in the launcher's weather list.
 pub fn composed(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(|c| ('\u{300}'..='\u{36f}').contains(&c)) {
@@ -101,10 +104,10 @@ pub struct Fonts {
     faces: Vec<(Weight, FontVec)>,
 }
 
-/// The system's fonts for the scripts Roboto has not (Chinese, Japanese, Korean, the
-/// Devanagari of Hindi, Arabic, Thai ...): read the first time such a character is drawn,
+/// The system's fonts for the scripts Inter has not (Chinese, Japanese, Korean, the
+/// Devanagari of Hindi, Arabic, Thai, Georgian ...): read the first time such a character is drawn,
 /// from where each system keeps them - nothing is shipped, and nothing is read for a
-/// language Roboto covers. Each carries the interface language it is best for: Chinese,
+/// language Inter covers. Each carries the interface language it is best for: Chinese,
 /// Japanese and Korean share thousands of characters and each font draws them its own
 /// country's way, so the interface's own language picks first.
 fn fallback_fonts() -> &'static [(&'static str, FontVec)] {
@@ -123,6 +126,7 @@ fn fallback_fonts() -> &'static [(&'static str, FontVec)] {
             ("th", "C:\\Windows\\Fonts\\tahoma.ttf"),
             ("hi", "C:\\Windows\\Fonts\\Nirmala.ttf"),
             ("hi", "C:\\Windows\\Fonts\\NirmalaUI.ttf"),
+            ("ka", "C:\\Windows\\Fonts\\sylfaen.ttf"),
             ("", "C:\\Windows\\Fonts\\segoeui.ttf"),
             // macOS
             ("zh", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
@@ -133,6 +137,7 @@ fn fallback_fonts() -> &'static [(&'static str, FontVec)] {
             ("th", "/System/Library/Fonts/Supplemental/Silom.ttf"),
             ("hi", "/System/Library/Fonts/Kohinoor.ttc"),
             ("hi", "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc"),
+            ("ka", "/System/Library/Fonts/SFGeorgian.ttf"),
             ("", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
             ("", "/System/Library/Fonts/GeezaPro.ttc"),
             // Android
@@ -142,16 +147,20 @@ fn fallback_fonts() -> &'static [(&'static str, FontVec)] {
             ("hi", "/system/fonts/NotoSansDevanagari-Regular.otf"),
             ("hi", "/system/fonts/NotoSansDevanagariUI-VF.ttf"),
             ("hi", "/system/fonts/NotoSansDevanagari-VF.ttf"),
+            ("ka", "/system/fonts/NotoSansGeorgian-VF.ttf"),
             ("", "/system/fonts/NotoNaskhArabic-Regular.ttf"),
             ("", "/system/fonts/DroidSansFallback.ttf"),
             // Linux
             ("", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
             ("", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
             ("", "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
+            ("", "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc"),
+            ("", "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc"),
             ("th", "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf"),
             ("th", "/usr/share/fonts/truetype/tlwg/Garuda.ttf"),
             ("hi", "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
             ("hi", "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf"),
+            ("ka", "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf"),
             ("", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"),
             ("", "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc"),
             ("", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
@@ -167,7 +176,7 @@ fn fallback_fonts() -> &'static [(&'static str, FontVec)] {
     })
 }
 
-/// The system font that draws `c` when Roboto has it not: one meant for the interface's
+/// The system font that draws `c` when Inter has it not: one meant for the interface's
 /// language first, then any. For the game's own texts as much as the launcher's.
 pub fn fallback_font(c: char) -> Option<&'static FontVec> {
     let fonts = fallback_fonts();
@@ -181,12 +190,12 @@ pub fn fallback_font(c: char) -> Option<&'static FontVec> {
     fonts.iter().find(|(_, f)| has(f)).map(|(_, f)| f)
 }
 
-/// Whether `c` has to come from another font than Roboto (`main`).
+/// Whether `c` has to come from another font than Inter (`main`).
 pub fn needs_fallback(main: &impl Font, c: char) -> bool {
     !(main.glyph_id(c).0 != 0 || (c as u32) < 0x2000 && !((c as u32) >= 0x0590 && (c as u32) < 0x1100))
 }
 
-/// The font that draws `c`: Roboto (`main`), else the first system font that has it.
+/// The font that draws `c`: Inter (`main`), else the first system font that has it.
 fn font_for<'a>(main: &'a FontVec, c: char) -> &'a FontVec {
     if !needs_fallback(main, c) {
         return main;
@@ -205,10 +214,8 @@ impl Fonts {
         let faces = Weight::ALL
             .iter()
             .filter_map(|&w| {
-                let mut f = FontVec::try_from_vec(ROBOTO.to_vec()).ok()?;
-                let (wght, wdth) = w.axes();
-                f.set_variation(b"wght", wght);
-                f.set_variation(b"wdth", wdth);
+                let mut f = FontVec::try_from_vec(INTER.to_vec()).ok()?;
+                f.set_variation(b"wght", w.wght());
                 Some((w, f))
             })
             .collect();
@@ -221,8 +228,13 @@ impl Fonts {
 
     /// Width of `text` in pixels at `px`.
     pub fn width(&self, text: &str, px: f32, weight: Weight) -> f32 {
-        let translated = crate::i18n::tr(text);
-        let comp = composed(&translated);
+        self.width_as_is(&crate::i18n::tr(text), px, weight)
+    }
+
+    /// [`Fonts::width`] of a text that is not the interface's own (a Lua plugin's): as it
+    /// is, not looked up in the translations.
+    pub fn width_as_is(&self, text: &str, px: f32, weight: Weight) -> f32 {
+        let comp = composed(text);
         let text = &*comp;
         let main = self.face(weight);
         let mut w = 0.0;
@@ -344,7 +356,7 @@ mod tests {
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
-    /// Scripts Roboto lacks are drawn with a system font where the system has one.
+    /// Scripts Inter lacks are drawn with a system font where the system has one.
     #[test]
     fn cjk_and_devanagari_come_from_the_system() {
         if fallback_fonts().is_empty() {
@@ -363,8 +375,8 @@ mod fallback_tests {
 mod glyph_tests {
     use super::*;
     #[test]
-    fn portuguese_letters_are_present_in_roboto() {
-        let f = ab_glyph::FontRef::try_from_slice(ROBOTO).unwrap();
+    fn portuguese_letters_are_present_in_inter() {
+        let f = ab_glyph::FontRef::try_from_slice(INTER).unwrap();
         // PT-BR + PT-PT: acute, grave, circumflex, tilde and cedilla, both cases.
         for c in "áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ".chars() {
             assert_ne!(f.glyph_id(c).0, 0, "missing Portuguese glyph {c}");
@@ -373,7 +385,7 @@ mod glyph_tests {
 
     #[test]
     fn missing_symbols_are_substituted() {
-        let f = ab_glyph::FontRef::try_from_slice(ROBOTO).unwrap();
+        let f = ab_glyph::FontRef::try_from_slice(INTER).unwrap();
         for c in "→★⚠✓▸ Bauernhof · 12 °C - ДёЖ".chars() {
             assert!(f.glyph_id(substitute(c)).0 != 0 || substitute(c) == ' ', "{c}");
         }

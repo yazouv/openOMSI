@@ -2,8 +2,8 @@
 //
 // Per pixel of the depth prepass, at full size, and the same every frame (nothing noisy that
 // needs frames to settle, so nothing that smears or crawls when the camera moves):
-// - the sun's shadow: one ray towards a point of the sun's disc, one of 16 of a fixed
-//   pattern that repeats every 4 x 4 pixels;
+// - the sun's shadow: one ray towards a point of the sun's disc (its true size, widened by a
+//   veil of high cloud: rt.rs), one of 16 of a fixed pattern that repeats every 4 x 4 pixels;
 // - ambient occlusion: two rays over the surface's hemisphere, their directions one of 32 of
 //   a fixed pattern that repeats every 4 x 4 pixels; the filter averages the pattern away
 //   over 5 x 5 pixels at the same depth.
@@ -54,10 +54,17 @@ fn cs_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sb = basis(p.sun.xyz);
         let sr = sqrt(su.x) * p.sun.w;
         let sd = normalize(p.sun.xyz + sb[0] * cos(6.2831853 * su.y) * sr + sb[1] * sin(6.2831853 * su.y) * sr);
-        vis = select(1.0, 0.0, ray_hit(RT_FORCE_OPAQUE | RT_FIRST_HIT, MASK_SHADOW, 0.0, 2000.0, o, sd).kind != RAY_QUERY_INTERSECTION_NONE);
+        // (a ray that leaves the surface at a slant runs along it for a while: the faceted
+        // ground, a road's camber and the steps' edges rise a few centimetres into its way
+        // and laid stripes of shadow over every surface the sun grazes. It starts where it
+        // has risen 2 cm above the surface: a few decimetres at the lowest suns, where a
+        // caster that close throws a shadow longer than the gap anyway)
+        let rise = max(dot(n, sd), 0.04);
+        let t0 = min(0.02 / rise, 0.5);
+        vis = select(1.0, 0.0, ray_hit(RT_FORCE_OPAQUE | RT_FIRST_HIT, MASK_SHADOW, t0, 2000.0, o, sd).kind != RAY_QUERY_INTERSECTION_NONE);
         if (vis > 0.0) {
             // through a bus's or a car's window: tinted glass lets only part of it in
-            vis = select(1.0, 0.45, ray_hit(RT_FORCE_OPAQUE | RT_FIRST_HIT, MASK_GLASS, 0.0, 200.0, o, sd).kind != RAY_QUERY_INTERSECTION_NONE);
+            vis = select(1.0, 0.45, ray_hit(RT_FORCE_OPAQUE | RT_FIRST_HIT, MASK_GLASS, t0, 200.0, o, sd).kind != RAY_QUERY_INTERSECTION_NONE);
         }
     }
     // --- the sky's occlusion
@@ -79,7 +86,11 @@ fn cs_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 var<workgroup> tile: array<vec4<f32>, 144>;
 
 // The rays filtered at the pixel's own depth over 5 x 5 pixels (the whole pattern of
-// directions).
+// directions). The pattern repeats every 4 pixels, so a plain 5 x 5 box counted one row and
+// one column of it twice - which ones, by the pixel's place in the pattern: a soft shadow's
+// edge kept a fixed 4 x 4 checker on the screen, which crawled over the surfaces as the
+// camera moved. The outer row and column on each side weigh a half: they are the same
+// pattern cells, and every one of the 16 counts exactly once.
 @compute @workgroup_size(8, 8)
 fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let origin = vec2<i32>(wid.xy) * 8 - vec2<i32>(2);
@@ -108,12 +119,13 @@ fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_
         for (var i = -2; i <= 2; i++) {
             let s = tile[(lp.y + j) * 12 + lp.x + i];
             if (s.g > 0.0 && s.b >= 0.0 && abs(s.g - c.g) < tol) {
-                ao += s.r;
-                aw += 1.0;
-                sun += s.b;
-                sw += 1.0;
+                let w = select(1.0, 0.5, abs(i) == 2) * select(1.0, 0.5, abs(j) == 2);
+                ao += s.r * w;
+                aw += w;
+                sun += s.b * w;
+                sw += w;
             }
         }
     }
-    textureStore(t_out, px, vec4<f32>(ao / max(aw, 1.0), c.g, sun / max(sw, 1e-4), 1.0));
+    textureStore(t_out, px, vec4<f32>(ao / max(aw, 1e-4), c.g, sun / max(sw, 1e-4), 1.0));
 }

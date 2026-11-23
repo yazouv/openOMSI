@@ -1,125 +1,6 @@
--- The Lua side of the `omsi` table: events, timers, watches and saved data.
--- (the Rust side, src/lua.rs, has put the functions that reach the game into `omsi`)
+-- The Lua side of the `omsi` table: the saved data. Everything else - the functions, the
+-- events, timers and watches - is the API registry's (src/api/), bound by src/lua.rs.
 local omsi = omsi
-local handlers = {}      -- event -> list of functions
-local timers = {}        -- id -> {at, every, fn}
-local next_id = 1
-local watches = {}       -- id -> {kind, name, fn, last}
-local clock = 0
-local last_info = {}
-
-function omsi.on(event, fn)
-  assert(type(event) == "string", "omsi.on: the event is a name")
-  assert(type(fn) == "function", "omsi.on: the handler is a function")
-  local list = handlers[event]
-  if not list then list = {}; handlers[event] = list end
-  list[#list + 1] = fn
-  return fn
-end
-
-function omsi.off(event, fn)
-  local list = handlers[event]
-  if not list then return end
-  for i = #list, 1, -1 do
-    if list[i] == fn then table.remove(list, i) end
-  end
-end
-
-function omsi.after(seconds, fn)
-  local id = next_id; next_id = id + 1
-  timers[id] = { at = clock + seconds, fn = fn }
-  return id
-end
-
-function omsi.every(seconds, fn)
-  assert(seconds > 0, "omsi.every: the interval must be above 0")
-  local id = next_id; next_id = id + 1
-  timers[id] = { at = clock + seconds, every = seconds, fn = fn }
-  return id
-end
-
--- omsi.watch("var", name, fn(new, old)) / omsi.watch(name, fn): fn runs when the value changes
-function omsi.watch(kind, name, fn)
-  if fn == nil then kind, name, fn = "var", kind, name end
-  assert(kind == "var" or kind == "str" or kind == "sys", "omsi.watch: kind is var, str or sys")
-  local id = next_id; next_id = id + 1
-  watches[id] = { kind = kind, name = name, fn = fn }
-  return id
-end
-
-function omsi.cancel(id)
-  timers[id] = nil
-  watches[id] = nil
-end
-
-function omsi.time() return clock end
-
-function omsi.emit(event, ...)
-  local list = handlers[event]
-  if list then
-    for _, fn in ipairs({ table.unpack(list) }) do fn(...) end
-  end
-  -- a global function of the same name: on_frame, on_start, ...
-  local g = rawget(_G, "on_" .. event)
-  if type(g) == "function" then g(...) end
-end
-
-local read = { var = omsi.var, str = omsi.str, sys = omsi.sys }
-
-function omsi._tick(dt)
-  clock = clock + dt
-  -- timers due, in id order (a timer may add or cancel others)
-  local due = {}
-  for id, t in pairs(timers) do
-    if t.at <= clock then due[#due + 1] = id end
-  end
-  table.sort(due)
-  for _, id in ipairs(due) do
-    local t = timers[id]
-    if t then
-      if t.every then t.at = t.at + t.every; if t.at <= clock then t.at = clock + t.every end
-      else timers[id] = nil end
-      t.fn()
-    end
-  end
-  for _, w in pairs(watches) do
-    local v = read[w.kind](w.name)
-    if v ~= w.last then
-      local old = w.last
-      w.last = v
-      if old ~= nil or v ~= nil then w.fn(v, old) end
-    end
-  end
-  -- the keys pressed since the last frame, then what changed in the game's state
-  for _, k in ipairs(omsi._keys()) do omsi.emit("key", k[1], k[2]) end
-  if handlers.next_stop or handlers.view or handlers.duty or rawget(_G, "on_next_stop") or rawget(_G, "on_view") or rawget(_G, "on_duty") then
-    local i = omsi.info()
-    -- (also to a stop of the same name: the two sides of a road often share one)
-    if i.next_stop ~= nil and (i.next_stop ~= last_info.next_stop or i.next_stop_number ~= last_info.next_stop_number) then
-      omsi.emit("next_stop", i.next_stop, last_info.next_stop)
-    end
-    if i.view ~= last_info.view then omsi.emit("view", i.view, last_info.view) end
-    if (i.line or "") .. "/" .. (i.tour or "") ~= (last_info.line or "") .. "/" .. (last_info.tour or "") then omsi.emit("duty", i.line, i.tour) end
-    last_info = i
-  end
-  omsi.emit("frame", dt)
-end
-
--- small helpers
-function omsi.speed()
-  return math.abs(omsi.var("Velocity") or 0)
-end
-
-function omsi.distance(x, y)
-  local px, py = omsi.position()
-  if not px then return nil end
-  return math.sqrt((px - x) ^ 2 + (py - y) ^ 2)
-end
-
-function omsi.clock()
-  local t = math.floor(omsi.info().clock or 0)
-  return string.format("%02d:%02d:%02d", t // 3600 % 24, t // 60 % 60, t % 60)
-end
 
 -- saved data: omsi.data is written on the way out and read back on the next start
 local function dump(v, indent, seen)
@@ -174,5 +55,95 @@ do
     local chunk = load(text, "=saved data", "t", { math = { huge = math.huge } })
     local ok, t = pcall(chunk or error)
     if ok and type(t) == "table" then omsi.data = t end
+  end
+end
+
+local process_enabled = omsi._process_enabled
+omsi._process_enabled = nil
+if not process_enabled then return end
+
+do
+  local poll = omsi.process.exit_code
+  local create_thread = omsi._budgeted_thread
+  local reset_thread = omsi._reset_thread
+  local resume_thread = omsi._resume_thread
+  coroutine.resume = resume_thread
+  coroutine.wrap = function(fn)
+    local thread = create_thread(fn)
+    return function(...)
+      local result = table.pack(resume_thread(thread, ...))
+      if not result[1] then error(result[2], 2) end
+      return table.unpack(result, 2, result.n)
+    end
+  end
+  local pool = {}
+  omsi._budgeted_thread, omsi._reset_thread, omsi._resume_thread = nil, nil, nil
+  local active, waiting
+  local stopping = false
+  local queue = {}
+  local marker = {}
+  local resume_call
+
+  resume_call = function(thread, ...)
+    local previous = active
+    active = thread
+    local result = table.pack(resume_thread(thread, ...))
+    active = previous
+    if not result[1] then
+      queue = {}
+      error(result[2], 0)
+    end
+    if coroutine.status(thread) == "suspended" then
+      if result[2] ~= marker or previous ~= nil then
+        queue = {}
+        error("only process.wait in a top-level plugin callback may suspend execution", 0)
+      end
+      waiting = {thread = thread, handle = result[3]}
+      return
+    end
+    if #pool < 8 then pool[#pool + 1] = thread end
+    return table.unpack(result, 2, result.n)
+  end
+
+  function omsi.process.wait(handle)
+    local code, state, reason = poll(handle)
+    if state ~= "running" then return code, state, reason end
+    if stopping then error("process.wait cannot suspend a stopping plugin", 2) end
+    if coroutine.running() ~= active then
+      error("process.wait requires managed plugin code, not a manually resumed coroutine", 2)
+    end
+    return coroutine.yield(marker, handle)
+  end
+
+  function omsi._managed_call(fn, ...)
+    if waiting then
+      if #queue >= 256 then error("too many deferred plugin callbacks", 0) end
+      queue[#queue + 1] = {fn = fn, args = table.pack(...)}
+      return
+    end
+    local thread = table.remove(pool)
+    if thread then reset_thread(thread, fn) else thread = create_thread(fn) end
+    return resume_call(thread, ...)
+  end
+
+  function omsi._process_waiting() return waiting ~= nil end
+
+  function omsi._resume_process_wait()
+    if not waiting then return false end
+    local code, state, reason = poll(waiting.handle)
+    if state == "running" then return true end
+    local task = waiting
+    waiting = nil
+    resume_call(task.thread, code, state, reason)
+    while not waiting and #queue > 0 do
+      local next_call = table.remove(queue, 1)
+      omsi._managed_call(next_call.fn, table.unpack(next_call.args, 1, next_call.args.n))
+    end
+    return true
+  end
+
+  function omsi._cancel_process_wait()
+    waiting, queue, active = nil, {}, nil
+    stopping = true
   end
 end

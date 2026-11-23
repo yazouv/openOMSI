@@ -34,13 +34,25 @@ OMSI 2 reads the first four and skips the rest. A model may declare any number o
 
 ## Textures of any resolution
 
-- Textures up to 16384 × 16384 pixels load: DDS (DXT1/3/5, uncompressed), TGA, BMP, PNG and
-  JPG. Where the graphics card cannot take that size, the texture is halved until it fits.
+- Textures up to 16384 × 16384 pixels load. Where the graphics card cannot take that size,
+  the texture is halved until it fits.
+- Every picture format of today's tools is read, by its content whatever its name says:
+  - DDS with the DX10 header (BC4, BC5, BC6H, BC7 as texconv, Substance and the engines
+    write them; R10G10B10A2, R11G11B10 float, R9G9B9E5, 16- and 32-bit float and 16-bit
+    channels, B5G6R5 / B5G5R5A1 / B4G4R4A4, R8G8, R8, A8; DX10 cube maps), ATI1 / ATI2 /
+    BC4U / BC5U (the z of a two-channel normal map is made from x and y), RXGB, Direct3D's
+    float formats, and OMSI's DXT1-5 and uncompressed DDS;
+  - KTX 1 and KTX 2 (not supercompressed) with RGBA8, BC1-BC7, ETC1, ETC2 / EAC and ASTC;
+  - PNG (also 16 bits per channel), JPEG (also progressive and CMYK), BMP, TGA, WebP, GIF,
+    TIFF, QOI, OpenEXR, Radiance HDR, ICO, PNM and farbfeld.
+- A texture named in a model (`bus.bmp`) is found as `bus.dds` first, then under its own
+  name, then as `.bmp`, `.tga`, `.jpg`, `.png`, `.jpeg`, `.webp`, `.tif`, `.tiff`, `.gif`,
+  `.ktx2`, `.ktx`, `.qoi`, `.hdr`, `.exr` and `.pnm`.
 - There is no 2 GB address-space limit: openOMSI is a 64-bit program.
 - A texture keeps its full resolution within 150 m of the camera, so a bus's own 4K
-  textures always stay sharp. Far scenery gives up detail only when the texture memory
-  (`texture_memory` in the settings, or `OMSI_TEXTURE_MEMORY`, in MB) runs out, as OMSI's
-  `[texmemlimit]` does.
+  textures always stay sharp. Far scenery gives up detail only when the texture budget
+  (`OMSI_TEXTURE_MEMORY`, in MB) or the video memory (`video_memory` in the settings, all
+  the game holds on the card) runs out, as with OMSI's `[texmemlimit]`.
 - `[scripttexture]`, `[htmltexture]` and `[texttexture]` / `[texttexture_enh]` can be any size the card
   takes.
 
@@ -87,6 +99,40 @@ Normal, roughness, metalness and occlusion maps beside a texture, up to 4096 × 
   `[spotlight]`'s, it is not moved onto the vehicle's front. A rear section's model may have
   its own; their variables are the bus's.
 
+- `[spotlight_cookie]` in the `model.cfg` is a lamp whose beam is a picture: what it would
+  show on a wall in front of it, its brightness and colour every way the lamp shines. One
+  value a line: position (x, y, z), direction (x, y, z), red, green, blue, range, the angle the
+  picture covers across and the one up and down (degrees), the picture, the switching variable;
+  then, if you want them, the fade time in seconds, a variable that turns the lamp to the
+  right (degrees) and one that turns it up (degrees):
+
+  ```
+  [spotlight_cookie]
+  0.9
+  5.85
+  0.75
+  0
+  1
+  -0.04
+  255
+  250
+  235
+  80
+  70
+  30
+  lowbeam_right.png
+  lights_main
+  0.15
+  cornering_yaw
+  ```
+
+  The picture's right is the lamp's right as seen from behind it. White is as bright as a
+  headlamp's beam at its strongest, black is no light. The enhanced graphics draw up to eight
+  different pictures at once; the classic graphics, and a lamp whose picture is missing, light
+  a plain cone round the picture's field instead.
+- With shadows on, the player's headlamps cast shadows too (Enhanced): the
+  lamps on the front that light the road share one shadow map, taken from between them.
+
 ## Screens: static cameras
 
 `[add_camera_reflexion_static]` in the `.bus` adds a camera for a screen - a CCTV monitor
@@ -104,6 +150,44 @@ that camera sees from the rear section.
 
 ## Models
 
+- A `[mesh]` (and every other place OMSI reads a mesh) may name a **glTF / GLB**, **FBX**
+  or **OBJ** file besides `.o3d` and `.x`; the format is told by the file's content. The
+  model is read in the frame the modelling tool shows it in - exported from Blender with the
+  vehicle's front along +Y, as for an `.o3d` - in metres (FBX in any unit), with every node's
+  transform applied:
+  - materials keep their base colour and their colour texture. A texture beside the model
+    (or in a `texture` folder beside it) is found there, one packed into a `.glb` or `.fbx`
+    is read from the file; the material is named after the picture's file name, so a
+    `[matl] <picture> <n>` of the model's `.cfg` acts on it as on an `.o3d`'s material;
+  - skins (bone names and weights) and blend shapes come along; an FBX may be ASCII or
+    binary of any version, an OBJ has its `.mtl` (`Kd`, `d`, `map_Kd`) and any polygons;
+  - `cargo run -p omsi-o3d --example mesh_info <file>` shows what openOMSI reads of a model.
+- `[led_glow_effect]` after a `[matl]` (a number from 0 to 1) says how much an LED panel's
+  dots glow in the enhanced picture: 1 the full `LED glow` setting, 0.5 half of it, 0 not at
+  all (the slot is no LED panel). Without it openOMSI guesses: a slot with a `\S:n` script
+  mask and a white light map is taken for an LED panel. See [file formats](FORMATS.md).
+- A mesh may carry **several visibility conditions** - no script needed for a mesh
+  shown by two variables at once:
+  - `[visible_range]` with a variable, the lowest and the highest value shows the mesh while
+    the variable is between them (both included): `[visible_range]` `gear` `1` `4`;
+  - once a mesh has a `[visible_range]`, a `!` or a `||`, every condition of a group must
+    hold; plain `[visible]` blocks alone keep OMSI 2's rule (the last one counts), so a mesh
+    shown by two variables at once writes one of them as a range round its value:
+    ```
+    [visible_range]
+    door_open
+    0.5
+    1.5
+
+    [visible]
+    lights_on
+    1
+    ```
+  - a `!` after the variable's name turns a condition round: `door_open !` then `1` shows
+    the mesh while the door is not open (with `[visible_range]` outside the range);
+  - a line `||` between two blocks starts another group of conditions: the mesh shows when
+    all of the conditions before it hold, or all of those after it, as `||` reads in a script.
+  A variable the vehicle does not have reads 0, as with OMSI 2's single `[visible]`.
 - `.o3d` files with 32-bit indices (the long-index flag) are drawn with their full vertex
   and face count; everything is drawn with 32-bit indices.
 - There is no limit on the number of meshes, materials, `[matl_change]` items, `[CTC]`
@@ -112,7 +196,7 @@ that camera sees from the rear section.
 ## Passenger doors: sixteen entries and sixteen exits
 
 OMSI 2 has the door variables of eight `[entry]` and eight `[exit]` paths a vehicle
-(`PAX_Entry0_Open` to `PAX_Entry7_Open`, the same with `_Req` and for `PAX_Exit`). openOMSI
+has (`PAX_Entry0_Open` to `PAX_Entry7_Open`, the same with `_Req` and for `PAX_Exit`). openOMSI
 has them for sixteen of each: `PAX_Entry8_Open` ... `PAX_Entry15_Open`, `PAX_Entry8_Req` ...
 and the same for the exits. An entry or exit past the eighth is a door of its own once the
 script sets its `_Open` variable (or lists it in a varlist); then its passengers wait for that
@@ -160,11 +244,26 @@ every `[stamper]` of every section, and a passenger with a ticket to stamp uses 
 nearest the door they came in by. Write one `[stamper]` block per validator (path point,
 then x, y, z of the device, as usual); OMSI 2 still takes the last of them.
 
+The validators count from 0 in the order the cabin file writes them. A stamp fires the
+sound trigger `ev_Stamper` (as in OMSI 2) and also `ev_StamperN` for validator N, so each
+one can have its own placed sound, and the script triggers `PAX_Stamper_Used` and
+`PAX_StamperN_Used` (for animations or ticket systems). OMSI 2 fires only `ev_Stamper`; a
+bus that gives each validator its own sound can mute the `ev_Stamper` one by a variable
+the `PAX_Stamper_Used` trigger sets.
+
 ## Scripts and plugins
 
 - Script variables and string variables have no count limit.
 - Lua plugins can read and write script variables, fire triggers and react to game events:
   see [Plugins](PLUGINS.md).
+- `(M.V.GetRadioName)` and `(M.V.GetRadioSong)` put what the bus radio plays on the string
+  stack: the station's name (as the stream gives it in `icy-name`, else as the station list
+  names it) and the title it gives (`StreamTitle`); both empty while the radio is off or the
+  station says nothing. Not in OMSI 2: check for an empty string.
+- The developer tools (**Ctrl+Shift+D**, see the [user guide](USER_GUIDE.md#developer-tools))
+  show and hold the variables, draw the paths, places, boxes, axles, lights, mirrors and views
+  over the bus, and read its paths.cfg, `[passengercabin]`, sound.cfg, `.bus`, model.cfg and
+  constfiles again while it drives.
 
 ## Radio: a map's stations and a bus's display
 
@@ -205,6 +304,36 @@ station), or `SndExt_Radio` (the station button, 0 = off) with `SndVol_Radio` (t
 0..1, up to 2). Dmitrij's "Magnitola" is served as it comes: while it shows its track,
 its `magnitola_1` (`frequency@station`, `@` the line break) gets the map's frequency for the
 place in its first line and the station and song in its second.
+
+## Weather of a real place
+
+A map can have live weather from Tomorrow.io: add an `openomsi_weather.cfg` beside its
+`global.cfg`. See [weather areas](WEATHER_REGIONS.md) for the format, the player's setup
+and the [community config editor](https://openomsi.mxnticek.eu/weather/).
+
+A map can also give its climate statistics in an `openomsi_climate.cfg` file. The `[temperature]`
+section of the file should contain 12 monthly mean temperatures (January to December) in °C
+(one per line), and the optional (currently unused) `[precipitation]` section should have
+the same 12 values, but for the precipitation in millimetres. These values will be used
+as baseline for natural weather preset.
+
+## Trolleybuses: poles, drive and a wire
+
+OMSI 2 has no overhead wire of its own; its trolleybus add-ons ship a plugin DLL that reads the
+bus's place out of Omsi.exe and cannot run here. openOMSI simulates the wire itself, and a
+trolleybus add-on needs two things to use it:
+
+* in the vehicle's `.bus`, a `[trolley_pole]` for each pole (the hinge on the roof, the boom's
+  length, spring force, mass, retriever and motor) and a drive: `[trolley_rheostat]` or
+  `[trolley_async]`. A vehicle that keeps its own scripted drive just adds the poles: its driving
+  torque then works on a wire and stops without one. A model with poles of its own says
+  `visible 0` and rotates them by the game's `Trolley_Pole<k>_Elev` and `_Azim` variables;
+* for a map, a `trolley.txt` beside its `global.cfg` (or in a mod's `maps/<name>/` folder for a
+  map that has none): the wire's spans with their sag, the sections and where they are dead,
+  the insulators and the switches.
+
+Every key and variable is in [TROLLEYBUS.md](TROLLEYBUS.md); the map's masts and hangers stay
+the map's own objects.
 
 ## What stays as in OMSI 2
 

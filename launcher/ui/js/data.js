@@ -1,0 +1,730 @@
+// Loading the content and keeping the duty: what the pages share.
+
+import { call, on, onPhone, inTauri } from './api.js';
+import { S, set, toast, remembered, remember } from './store.js';
+import { setLanguage, t, hhmm } from './i18n.js';
+
+/** The duty as the launcher remembers it (`launcher-duty.json`, shared with the game's own
+ * launcher window: the same fields). */
+export const CHOICE_DEFAULTS = {
+  bus: '', paint: '', plate: '', number: '', hof: '', hof_manual: false,
+  map: '', entry: -1, line: null, tour: null, free: false,
+  time: 9 * 60, start_trip: null, date: '1989-05-30',
+  season: 'auto', phase: 'mid', own_date: null,
+  weather: '', traffic: 30, passengers: true, schedule: true, autostart: false, comfortable_cabin_on_start: false, on_foot: false,
+  lan_mode: 'off', lan_addr: '', lan_ws_fallback: null, version: 2,
+};
+
+export async function boot() {
+  const b = await call('bootstrap');
+  await setLanguage(b.language);
+  const choice = { ...CHOICE_DEFAULTS, ...(b.choice || {}) };
+  // (a server joined in an earlier session is not joined again by itself)
+  if (choice.lan_mode === 'join') Object.assign(choice, { lan_mode: 'off', lan_ws_fallback: null });
+  if (choice.version < 2) Object.assign(choice, { entry: -1, version: 2 });
+  Object.assign(choice, clockPatch(choice, b.settings));
+  set({ boot: b, settings: b.settings, config: b.config, choice, favourites: b.favourites || [], ready: true, page: b.root ? 'drive' : 'setup' });
+  if (b.crash) set({ crash: b.crash });
+  reconcileTheme(b.settings);
+  await applyTheme();
+  if (b.root) {
+    loadContent();
+    readAhead();
+    loadDepot();
+    // (the bus preview's helper and renderer get ready while the page is read)
+    call('preview_warm').catch(() => {});
+  }
+  startPolling();
+  on('vehicles-progress', (p) => set({ vehiclesProgress: p }));
+  if (b.updated) toast(t('openOMSI {version} is installed', { version: b.updated }), 'ok', 8000);
+}
+
+export const LAUNCHER_SIZES = [['0.7', 'Smallest'], ['0.8', 'Very small'], ['0.9', 'Smaller'], ['1', 'Normal'], ['1.15', 'Larger'], ['1.3', 'Largest']];
+
+export const launcherSize = () => remembered('launcher_size', '1');
+
+export const LAUNCHER_LAYOUTS = [
+  ['bigmap', 'Big Map: the map fills the page'],
+  ['control', 'Control Room: everything side by side'],
+  ['classicplus', 'Classic+: two tabs, time and weather on top'],
+  ['classic', 'Classic: in steps, as before'],
+];
+
+export const launcherLayout = () => {
+  const l = remembered('launcher_layout', 'bigmap');
+  return LAUNCHER_LAYOUTS.some(([id]) => id === l) ? l : 'bigmap';
+};
+
+export function fitWindow() {
+  if (inTauri) call('fit_zoom', { size: Number(launcherSize()) || 1 }).catch(() => {});
+}
+
+export function resolvedTheme(pick = remembered('theme', 'dark')) {
+  return pick === 'light' || (pick === 'system' && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+}
+
+// 啟動與重新載入皆以遊戲儲存值為準，避免舊的啟動器偏好覆寫它。
+// System 僅在目前解析值與儲存值一致時保留；不同時採用明確的 Light／Dark。
+function reconcileTheme(settings) {
+  const gameTheme = settings.ui_theme === 'light' ? 'light' : 'dark';
+  if (remembered('theme') !== 'system' || resolvedTheme() !== gameTheme) remember('theme', gameTheme);
+}
+
+export function applyTheme() {
+  const resolved = resolvedTheme();
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.dataset.layout = launcherLayout();
+  if (S.ready && S.settings && S.settings.ui_theme !== resolved) {
+    const previous = S.settings.ui_theme;
+    return saveSettings({ ui_theme: resolved }).then((saved) => {
+      if (saved === false) set({ settings: { ...S.settings, ui_theme: previous } });
+      return saved;
+    });
+  }
+  return Promise.resolve();
+}
+
+export async function loadContent() {
+  const errors = { ...S.errors };
+  const [maps, weather] = await Promise.all([
+    call('maps').catch((e) => ((errors.maps = e.message), [])),
+    call('weather').catch((e) => ((errors.weather = e.message), [])),
+  ]);
+  // (a weather's name comes in English where OMSI has none in the interface's language: the
+  // interface's tables translate it further)
+  set({ maps, weather: weather.map((w) => ({ ...w, name: t(w.name) })), errors });
+  fixChoice();
+  loadLines();
+  loadSituations();
+  loadVehicles();
+  loadProfiles();
+}
+
+let vehiclesBusy = false;
+let vehiclesAgain = false;
+function loadVehicles() {
+  if (vehiclesBusy) {
+    vehiclesAgain = true;
+    return;
+  }
+  vehiclesBusy = true;
+  call('vehicles')
+    .then((vehicles) => {
+      set({ vehicles, vehiclesProgress: null });
+      fixChoice();
+      updateHof();
+    })
+    .catch((e) => set({ vehicles: [], errors: { ...S.errors, vehicles: e.message } }))
+    .finally(() => {
+      vehiclesBusy = false;
+      if (vehiclesAgain) {
+        vehiclesAgain = false;
+        loadVehicles();
+      }
+    });
+}
+
+export const weatherOfItsOwn = (w) => /^(cycle$|tomorrow$|metar:|custom:)/i.test(w || '');
+
+export const weatherName = (w, list) =>
+  /^metar:/i.test(w || '') ? `${t('Current weather')}${w.length > 6 ? ` (${w.slice(6)})` : ''}`
+  : /^tomorrow$/i.test(w || '') ? 'Tomorrow.io'
+  : /^cycle$/i.test(w || '') ? t('Weather cycle')
+  : /^custom:/i.test(w || '') ? t('Custom weather')
+  : list?.find((x) => x.file === w)?.name || t('Natural weather');
+
+/** A remembered map or bus that is not installed any more gives way to the first one. */
+export function fixChoice() {
+  const c = { ...S.choice };
+  let mapChanged = false;
+  if (S.maps?.length && !S.maps.some((m) => m.file === c.map)) {
+    c.map = (S.maps.find((m) => /grundorf/i.test(m.file)) || S.maps[0]).file;
+    c.entry = -1;
+    mapChanged = true;
+  }
+  const available = selectableVehicles(c);
+  if (available.length && !available.some((v) => busFile(v.file) === busFile(c.bus))) {
+    c.bus = available[0].file;
+    c.paint = '';
+    c.number = available[0].server_only ? '' : randomFleetNumber(available[0]);
+  }
+  if (S.weather && c.weather && !weatherOfItsOwn(c.weather) && !S.weather.some((w) => w.file === c.weather)) c.weather = '';
+  // (a date the player picked stays even outside the map's [years]; only a map that had
+  // to give way to another one takes a date the new map allows)
+  if (mapChanged) c.date = fitDateToMap(c.date, c.map);
+  Object.assign(c, allowedBus(c));
+  set({ choice: c });
+}
+
+const norm = (f) => (f || '').replace(/\\/g, '/').toLowerCase();
+
+export const busFile = (f) => {
+  const n = norm(f);
+  const at = n.lastIndexOf('vehicles/');
+  return at > 0 ? n.slice(at) : n;
+};
+
+export function serverBuses(c = S.choice) {
+  return c?.lan_mode === 'join' && c.lan_server?.vehicles?.length ? new Set(c.lan_server.vehicles.map(busFile)) : null;
+}
+
+/** A server's paint names for a bus, each once (whatever its case or spaces) and without
+ * the bus's own standard look, which the paint lists already offer as "Standard". */
+function offeredPaints(names, standard = '') {
+  const seen = new Set([String(standard || '').trim().toLowerCase()].filter(Boolean));
+  return (names || []).filter((name) => {
+    const key = String(name || '').trim().toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Local buses are preferred; server-only entries are selectable after the server
+ * announces named paints. Actual bytes come through the verified session transfer. */
+export function selectableVehicles(c = S.choice) {
+  const allowed = serverBuses(c);
+  const local = (S.vehicles || []).filter((v) => !allowed || allowed.has(busFile(v.file)));
+  if (!allowed || c?.lan_server?.fleet_version !== 1) return local;
+  const byKey = new Map((c.lan_server.fleet || []).filter((f) => f?.bus && allowed.has(busFile(f.bus))).map((f) => [busFile(f.bus), f]));
+  // A configured server may list a .bus that it cannot load. Only the actual
+  // authenticated-package catalogue can be selected; never allow a local-only
+  // copy of a broken/non-advertised bus to bypass version verification.
+  const out = local.filter((v) => byKey.has(busFile(v.file))).map((v) => {
+    const offer = byKey.get(busFile(v.file));
+    return { ...v, local_paints: v.paints || [], paints: offeredPaints(offer.paints, v.default_paint), server_catalog: true };
+  });
+  const have = new Set(out.map((v) => busFile(v.file)));
+  for (const offer of byKey.values()) {
+    if (have.has(busFile(offer.bus))) continue;
+    const components = offer.bus.replace(/\\/g, '/').split('/');
+    const basename = (components.pop() || 'Bus').replace(/\.(bus|ovh)$/i, '').replace(/_/g, ' ');
+    const maker = (components[components.length - 1] || 'Server').replace(/_/g, ' ');
+    out.push({
+      name: basename, type_name: basename, manufacturer: maker, file: offer.bus,
+      folder: components.join('/'), description: 'Offered by the joined server; its verified version is downloaded for this session.',
+      default_paint: '', paints: offeredPaints(offer.paints), hofs: [], numbers: [], installed: false,
+      server_only: true, server_catalog: true, transport: ['bus'], missing_packs: [],
+    });
+  }
+  return out;
+}
+
+/** A server-only bus has no local preview. If a local bus exists, show only
+ * paints actually installed here; a server-only repaint remains a placeholder
+ * until the verified server content is mounted. The preview of a local model
+ * is not proof that its script/content version matches the server. */
+export function canPreviewBus(v, paint = '') {
+  if (!v || v.server_only) return false;
+  if (!v.server_catalog || !paint) return true;
+  return (v.local_paints || []).some((name) => name.toLowerCase() === paint.toLowerCase());
+}
+
+export function allowedBus(c = S.choice) {
+  const allowed = serverBuses(c);
+  if (!allowed) return {};
+  const offered = selectableVehicles(c);
+  const selected = offered.find((v) => busFile(v.file) === busFile(c.bus));
+  if (selected) {
+    // A server may have removed a repaint since the previous visit. Keep a
+    // still-offered paint, otherwise fall back to the bus's default look.
+    const names = selected.paints || [];
+    return c.paint && !names.some((p) => p.toLowerCase() === c.paint.toLowerCase())
+      ? { paint: '' } : {};
+  }
+  // The path can still be in vehicles but no longer have a loadable LISTBUS
+  // catalogue entry. Never leave such a stale bus selected if another works.
+  const first = offered[0];
+  return first ? { bus: first.file, paint: '', number: '', hof_manual: false } : {};
+}
+
+export const noServerBus = () => !!serverBuses() && !!S.vehicles && selectableVehicles().length === 0;
+
+export const serverJoined = (answer) => ({
+  lan_server: {
+    asked: !!answer, name: answer?.name || '', time: answer?.time || '',
+    weather: answer?.weather || '', vehicles: answer?.vehicles || [],
+    fleet_version: Number(answer?.fleet_version) || 0,
+    fleet: Array.isArray(answer?.fleet) ? answer.fleet : [],
+  },
+});
+
+/** Refresh once when opening the picker: saved server status can predate the
+ * fleet catalogue, even when the game server is now running the latest build. */
+export async function askJoined({ refresh = false } = {}) {
+  const c = S.choice;
+  if (c?.lan_mode !== 'join' || (!refresh && c.lan_server?.asked)) return c?.lan_server || null;
+  const address = c.lan_addr?.trim();
+  if (!address) return null;
+  const r = await call('server_query', { address }).catch(() => null);
+  if (!r || S.choice.lan_mode !== 'join' || S.choice.lan_addr?.trim() !== address) return null;
+  choose({ ...serverJoined({ ...r, name: c.lan_server?.name || r.name }), lan_map: c.lan_map || r.map || '' });
+  choose(allowedBus());
+  return r;
+}
+
+/** A bus as people call it (its [friendlyname]), from its file: never "MAN_SD77.bus". */
+export function busName(file) {
+  const v = S.vehicles?.find((x) => norm(x.file) === norm(file));
+  if (v) return v.name;
+  return (file || '').replace(/\\/g, '/').split('/').pop().replace(/\.(bus|ovh)$/i, '').replace(/_/g, ' ').trim();
+}
+
+/** A map as people call it, from its file (`maps/Grundorf/global.cfg`). */
+export function mapName(file) {
+  const m = S.maps?.find((x) => norm(x.file) === norm(file));
+  if (m) return m.friendly || m.name;
+  return (file || '').replace(/\\/g, '/').split('/').filter(Boolean).slice(-2, -1)[0] || file;
+}
+
+/** Transport modes (bus, tram, railway, metro, trolleybus). A map that names none takes every
+ * vehicle; otherwise the vehicle must share a mode with it. Mirrors `transport_refusal` of the
+ * launcher core, so the pickers can say why before the game does. */
+export const MODES = ['bus', 'tram', 'railway', 'metro', 'trolleybus'];
+export const modeLabel = (m) => t({ bus: 'Bus', tram: 'Tram', railway: 'Railway', metro: 'Metro', trolleybus: 'Trolleybus' }[m] || m);
+export function transportRefusal(map, vehicle) {
+  const a = map?.transport || [];
+  const b = vehicle?.transport || [];
+  if (!a.length || a.some((m) => b.includes(m))) return null;
+  return t('This map is made for {maps} only; the vehicle counts as {vehicle}.', { maps: a.map(modeLabel).join(', '), vehicle: b.length ? b.map(modeLabel).join(', ') : t('nothing known') });
+}
+/** Modes worth showing as a tag: everything but a plain bus, whose tag would be noise on the
+ * thousands of stock buses. */
+export const shownModes = (x) => (x?.transport || []).filter((m) => m !== 'bus' || (x.transport.length > 1));
+
+export const curMap = () => S.maps?.find((m) => m.file === S.choice?.map);
+export const curBus = () => selectableVehicles().find((v) => busFile(v.file) === busFile(S.choice?.bus));
+export const curLine = () => S.lines.list?.find((l) => l.name === S.choice?.line);
+// Old saved choices use the displayed number; new choices identify the variant.
+export const tourId = (tour) => tour?.id ?? tour?.number;
+export const resolveTour = (line, selection) => line?.tours.find((x) => tourId(x) === selection) || line?.tours.find((x) => x.number === selection && x.runs) || line?.tours.find((x) => x.number === selection);
+export const curTour = () => resolveTour(curLine(), S.choice?.tour);
+export const realTime = () => !!S.settings?.use_real_time;
+export const realDate = () => !!S.settings?.use_real_date;
+
+/** `date` (YYYY-MM-DD) fitted to the year span of the map `file` (its `[years]`), as OMSI 2
+ * starts a map on a day it allows: the same day in the nearest allowed year, 29 February the
+ * 28th where that year has none. Inside the span, or not a date: kept. The launcher core
+ * fits the game's date the same way (`fit_date_to_years`). */
+export function fitDateToMap(date, file) {
+  const span = !(S.settings?.use_real_date && S.settings?.use_real_year) && S.maps?.find((m) => m.file === file)?.year_span;
+  const parts = /^(\d+)-(\d+)-(\d+)$/.exec((date || '').trim());
+  if (!span || !parts) return date;
+  const [, y, mm, dd] = parts;
+  const was = Number(y);
+  const year = was < span[0] ? span[0] : was > span[1] ? span[1] : was;
+  if (year === was) return date;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const day = mm === '02' && dd === '29' && !leap ? '28' : dd;
+  return `${String(year).padStart(4, '0')}-${mm}-${day}`;
+}
+
+/** The time and date the duty takes from the computer's clock, as `duty_args` gives them to
+ * the game (the year stays the duty's unless the real year is on). */
+function clockPatch(c, st) {
+  const now = new Date();
+  const patch = {};
+  if (st?.use_real_time) {
+    const m = now.getHours() * 60 + now.getMinutes();
+    if (c.time !== m) patch.time = m;
+  }
+  if (st?.use_real_date) {
+    const year = st.use_real_year ? now.getFullYear() : parseInt(c.date, 10) || now.getFullYear();
+    // (the computer's date is fitted to the map's [years]; a date the player chose is kept,
+    // see `choose`)
+    const d = fitDateToMap(`${String(year).padStart(4, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`, c.map);
+    if (c.date !== d) patch.date = d;
+  }
+  return patch;
+}
+
+/** Keep the duty shown on the computer's clock while the settings ask for it. */
+export function followClock() {
+  if (!S.choice) return;
+  const patch = clockPatch(S.choice, S.settings);
+  if (Object.keys(patch).length) choose(patch);
+}
+
+let saveTimer = 0;
+function randomFleetNumber(vehicle) {
+  const numbers = vehicle?.numbers || [];
+  return numbers.length ? numbers[Math.floor(Math.random() * numbers.length)][0] : '';
+}
+
+/** Change the duty (and keep it on disk a moment later). */
+export function choose(patch) {
+  const before = S.choice;
+  const c = { ...before, ...patch };
+  // (a map's [years] only move the date when another map is chosen: a date the player
+  // picked or typed stays as it is, even outside them)
+  if (c.map !== before.map) c.date = fitDateToMap(c.date, c.map);
+  if (c.bus !== before.bus && !patch.number) {
+    c.number = randomFleetNumber(S.vehicles?.find((v) => v.file === c.bus));
+  }
+  // (another bus does not carry on with the depot bus's plate)
+  if (c.bus !== before.bus && !('plate' in patch) && depotBusOf(before)) c.plate = '';
+  // (nor with the variables picked for it: its onboard computer is its own)
+  if (c.bus !== before.bus && !('setvars' in patch)) c.setvars = {};
+  set({ choice: c });
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => call('choice_save', { choice: S.choice }).catch(() => {}), 400);
+  if (c.map !== before.map || c.date !== before.date) {
+    loadLines();
+  }
+  if (c.map !== before.map) loadSituations();
+  if (c.map !== before.map || c.bus !== before.bus || c.date !== before.date || c.line !== before.line || c.free !== before.free) updateHof();
+  else if (c.hof !== before.hof || c.hof_manual !== before.hof_manual) loadIbis();
+}
+
+export async function loadLines() {
+  const c = S.choice;
+  if (!c?.map) return;
+  const key = `${c.map}|${c.date}`;
+  if (S.lines.key === key && (S.lines.list || S.lines.loading)) return;
+  set({ lines: { key, list: S.lines.key.split('|')[0] === c.map ? S.lines.list : null, loading: true, error: null } });
+  try {
+    const list = await call('lines', { map: c.map, date: c.date });
+    if (S.lines.key !== key) return;
+    set({ lines: { key, list, loading: false, error: null } });
+    // a line or tour that is not there on this date gives way to the first one
+    const line = list.find((l) => l.name === S.choice.line) || list.find((l) => l.user_allowed && l.tours.length) || null;
+    const tour = resolveTour(line, S.choice.tour) || line?.tours.find((x) => x.runs) || line?.tours[0] || null;
+    if (line?.name !== S.choice.line || tourId(tour) !== S.choice.tour) choose({ line: line?.name ?? null, tour: tourId(tour) ?? null });
+  } catch (e) {
+    if (S.lines.key === key) set({ lines: { key, list: [], loading: false, error: e.message } });
+  }
+}
+
+export async function updateHof() {
+  const c = S.choice;
+  const hof = await call('default_hof', { map: curMap() || null, bus: curBus() || null, date: c.date, line: c.free ? null : c.line }).catch(() => '');
+  set({ hof });
+  loadIbis();
+}
+
+export const dutyHof = () => (S.choice.hof_manual ? S.choice.hof : S.hof) || '';
+
+let ibisAsked = '';
+let ibisTrip = null;
+export async function loadIbis(trip = ibisTrip) {
+  if (onPhone) return;
+  ibisTrip = trip;
+  const c = S.choice;
+  const hof = /\.(bus|ovh)/i.test(dutyHof()) ? '' : dutyHof();
+  const base = c.free || !c.line || !c.bus ? '' : `${c.bus}|${hof}|${c.line}`;
+  const stops = trip?.stops.map((x) => x.name) || [];
+  const key = base && `${base}|${trip?.terminus || ''}|${stops.join('|')}`;
+  if (key === ibisAsked) return;
+  if (!key || !ibisAsked.startsWith(`${base}|`)) set({ ibis: null });
+  ibisAsked = key;
+  if (!key) return;
+  const ibis = await call('ibis', { bus: c.bus, hof, line: c.line, terminus: trip?.terminus || '', stops }).then((info) => ({ info }), (e) => ({ error: e.message || String(e) }));
+  if (ibisAsked !== key) return;
+  if ('error' in ibis) ibisAsked = '';
+  set({ ibis });
+}
+
+export async function loadDepot() {
+  try {
+    const d = await call('depot_get');
+    set({ depot: d.buses, depotGroups: d.groups, errors: { ...S.errors, depot: null } });
+  } catch (e) {
+    set({ depot: [], errors: { ...S.errors, depot: e.message } });
+  }
+}
+
+/** The depot bus the duty drives: its bus, livery, plate and fleet number all as they are. */
+export function depotBusOf(c = S.choice) {
+  const plate = (c?.plate || '').trim().toUpperCase();
+  return c && plate ? S.depot?.find((b) => busFile(b.bus) === busFile(c.bus) && (b.paint || '') === (c.paint || '') && b.plate === plate && (b.number || '') === (c.number || '').trim()) : null;
+}
+
+/** Take a depot bus for the next duty. */
+export function driveDepotBus(b) {
+  const v = S.vehicles?.find((x) => busFile(x.file) === busFile(b.bus));
+  if (!v) return;
+  choose({ bus: v.file, paint: b.paint, plate: b.plate, number: b.number, hof_manual: false });
+  if (S.choice.number !== b.number) choose({ number: b.number });
+  set({ page: 'drive' });
+  toast(t('{name} is ready under Drive: choose the time and the duty.', { name: b.name }), 'ok');
+}
+
+export async function loadSituations() {
+  if (!S.choice?.map) return;
+  set({ situations: await call('saved_situations', { map: S.choice.map }).catch(() => []) });
+}
+
+/** Page data kept between visits: answered at once from what was read last, read again
+ * behind it (`fresh` = the command's answer is set into `S.cache[key]`). */
+export function cached(key, cmd, args) {
+  const had = S.cache[key];
+  const p = reread(key, cmd, args).catch(() => null);
+  return had !== undefined ? Promise.resolve(had) : p;
+}
+
+const asked = {};
+const latest = {};
+
+/** Rejects on a failed read: a failed read confirms no install, switch or delete (#4016, #4017). */
+export function reread(key, cmd, args) {
+  const n = (asked[key] = (asked[key] || 0) + 1);
+  const before = S.cache[key];
+  if (!S.reading[key]) set({ reading: { ...S.reading, [key]: true } });
+  const keep = (v, error) => {
+    if (asked[key] !== n) return latest[key];
+    const last = S.cache[key];
+    const written = last !== before;
+    const kept = written || (error && last !== undefined && !last?.error);
+    set({
+      cache: { ...S.cache, [key]: kept ? last : error ? { error } : v },
+      reading: { ...S.reading, [key]: false },
+      readError: { ...S.readError, [key]: written ? null : error },
+    });
+    if (written) return last;
+    if (error) throw new Error(error);
+    return v;
+  };
+  const p = call(cmd, args).then(
+    (v) => keep(v, null),
+    (e) => keep(null, e.message),
+  );
+  latest[key] = p;
+  return p;
+}
+
+export async function rereadUntil(key, cmd, args) {
+  for (let wait = 1000, told = false; ; wait = Math.min(wait * 2, 30000)) {
+    try {
+      return await reread(key, cmd, args);
+    } catch (e) {
+      if (!told) toast(t(e.message), 'error');
+      told = true;
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+}
+
+/** What the pages show, read ahead while the launcher starts. */
+function readAhead() {
+  cached('mods', 'mods_status');
+  cached('servers', 'servers_get');
+  cached('tutorials', 'tutorials');
+  cached('keys', 'keybindings_get');
+}
+
+export async function loadProfiles() {
+  const profiles = await call('profiles').catch(() => []);
+  set({ profiles });
+  const name = S.config?.profile || profiles[0];
+  if (name) set({ profile: await call('profile', { name }).catch(() => null) });
+}
+
+let settingsSaved = Promise.resolve();
+let settingsSeq = 0;
+
+export function reloadSettings() {
+  settingsSaved = settingsSaved.then(async () => {
+    const mine = settingsSeq;
+    const now = await call('settings_get').catch(() => null);
+    if (!now || mine !== settingsSeq) return;
+    const before = S.settings?.language;
+    reconcileTheme(now);
+    set({ settings: now });
+    if (now.language !== before) await applyLanguage();
+    await applyTheme();
+  });
+  return settingsSaved;
+}
+
+async function applyLanguage() {
+  const lang = S.boot.languages.find((l) => l.code === S.settings.language);
+  await setLanguage(lang?.iso || 'en');
+  // (the content's names and descriptions are read in the new language)
+  loadContent();
+}
+
+export async function saveSettings(patch, whole = false) {
+  set({ settings: whole ? patch : { ...S.settings, ...patch } });
+  const mine = ++settingsSeq;
+  let ok = true;
+  settingsSaved = settingsSaved.then(async () => {
+    try {
+      const saved = await call(whole ? 'settings_save' : 'settings_patch', whole ? { settings: patch } : { patch });
+      if (mine === settingsSeq) set({ settings: saved });
+    } catch (e) {
+      ok = false;
+      toast(t('The settings could not be saved: {e}', { e: e.message }), 'error');
+    }
+  });
+  await settingsSaved;
+  if (!ok) return false;
+  if (!whole && 'language' in patch) await applyLanguage();
+  return true;
+}
+
+/** The trip of the tour picked to start with (its place), while the time is still its. */
+export function pickedTrip() {
+  const c = S.choice;
+  const st = c.start_trip;
+  if (!st || c.free) return null;
+  const [line, tour, index, time] = st;
+  return line === c.line && tour === c.tour && (time === c.time || realTime()) ? index : null;
+}
+
+/** What the game is started with. */
+export async function duty(extra = {}) {
+  const c = S.choice;
+  const seasonWord = c.season && c.season !== 'auto' ? (await call('season_date', { season: c.season, phase: c.phase, date: c.date, map: c.map, keep: true }).catch(() => null))?.word : null;
+  const trip = pickedTrip();
+  const ask = () => Promise.race([call('server_query', { address: c.lan_addr.trim() }).catch(() => null), new Promise((r) => setTimeout(r, 3000))]);
+  const joined = c.lan_mode === 'join' && !extra.tutorial && !extra.situation ? c.lan_map || (await ask())?.map : '';
+  // (the variables picked for the bus; an empty one means the paint's own value)
+  const setvars = Object.fromEntries(Object.entries(c.setvars || {}).filter(([, v]) => String(v ?? '').trim() !== ''));
+  const hostMap = (joined || '').trim().replace(/\\/g, '/');
+  const installed = S.maps?.find((m) => m.file.toLowerCase() === hostMap.toLowerCase())?.file;
+  return {
+    map: /maps\//i.test(hostMap) ? installed || hostMap : c.map,
+    bus: c.bus,
+    paint: c.paint || null,
+    plate: c.plate?.trim() || null,
+    number: c.number?.trim() || null,
+    setvars: Object.keys(setvars).length ? setvars : null,
+    hof: dutyHof() || null,
+    entry: c.entry,
+    line: c.free ? null : c.line,
+    tour: c.free ? null : curTour()?.number ?? null,
+    trip: trip != null ? String(trip) : null,
+    whole_tour: trip != null,
+    time: hhmm(c.time),
+    date: c.date,
+    weather: c.weather || null,
+    traffic: Math.round(c.traffic),
+    passengers: c.passengers,
+    schedule: c.schedule,
+    autostart: c.autostart,
+    comfortable_cabin_on_start: c.comfortable_cabin_on_start,
+    on_foot: c.on_foot,
+    profile: S.config?.profile || null,
+    lan: c.lan_mode === 'host' ? 'host' : c.lan_mode === 'join' ? `join:${c.lan_addr.trim()}` : 'off',
+    lan_name: null,
+    lan_ws_fallback: c.lan_mode === 'join' ? c.lan_ws_fallback || null : null,
+    season: seasonWord || null,
+    tutorial: null,
+    situation: null,
+    depot: depotBusOf(c)?.id || null,
+    ...extra,
+  };
+}
+
+/** A dedicated server's published fleet entry needs explicit consent before launch. */
+export function serverFleetSelection(c = S.choice) {
+  const allowed = serverBuses(c);
+  return !!allowed?.has(busFile(c.bus)) && c.lan_server?.fleet_version === 1
+    && (c.lan_server.fleet || []).some((offer) => busFile(offer.bus) === busFile(c.bus));
+}
+
+export async function start(extra) {
+  try {
+    const approved = extra?.__fleetApproved === true;
+    // UI-only consent: do not serialize this ephemeral flag into the launch duty.
+    const { __fleetApproved: _consent, ...dutyExtra } = extra || {};
+    const d = await duty(dutyExtra);
+    if (serverBuses() && S.choice?.lan_server?.fleet_version === 1 && !serverFleetSelection()) {
+      // Only the new authoritative catalogue requires a verified LISTBUS offer.
+      // Older player-hosted and dedicated sessions still use their original
+      // map-only LIST protocol and must remain joinable with local vehicles.
+      // A v1 catalogue with an unreadable/removed bus must fail closed.
+      toast(t('The server has not announced a downloadable version of this bus. Choose another bus or contact the server owner.'), 'error');
+      return null;
+    }
+    if (serverFleetSelection() && !approved) {
+      toast(t('Confirm the server download before joining.'), 'error');
+      return null;
+    }
+    d.allow_server_fleet = approved && serverFleetSelection();
+    const r = await call('launch', { duty: d });
+    set({ gameStarted: true });
+    if (d.lan !== 'off' && d.lan !== 'host' && !d.tutorial) set({ page: 'games' });
+    toast(r.others ? t('The game is starting ({n} already running)', { n: r.others }) : t('The game is starting…'), 'ok');
+    pollNow();
+    return r;
+  } catch (e) {
+    toast(t(e.message), 'error');
+    return null;
+  }
+}
+
+// --- polling: running games, installs, content changes ----------------------------------
+
+let polling = false;
+export const jobRunning = (j) => !!j.state && !['done', 'failed', 'cancelled'].includes(j.state);
+
+export async function installMod(path) {
+  const mode = S.modMode || 'auto';
+  set({ modPath: path, modInfo: null });
+  call('mod_inspect', { path })
+    .then((i) => {
+      if (S.modPath !== path) return;
+      set({ modInfo: i });
+      if (!i.fits && i.in_place_ok && (S.modMode || 'auto') === 'extract') set({ modMode: 'inplace' });
+    })
+    .catch((e) => S.modPath === path && set({ modInfo: { error: e.message } }));
+  try {
+    await call('mod_install', { path, mode });
+    toast(t('Installing {name}…', { name: path.split(/[\\/]/).pop() }));
+    pollNow();
+  } catch (e) {
+    toast(t(e.message), 'error');
+  }
+}
+
+export async function pollNow() {
+  if (polling) return;
+  polling = true;
+  try {
+    const p = await call('poll');
+    const changed = S.poll.stamp && p.stamp !== S.poll.stamp;
+    const before = S.poll.jobs || [];
+    const same = (x) => JSON.stringify([x.stamp, x.jobs, x.instances, x.ended]);
+    if (same(p) !== same(S.poll) || p.started?.length) set({ poll: p });
+    for (const s of p.started || []) toast(t('Installing {name}…', { name: s }));
+    const finished = S.poll.stamp ? (p.jobs || []).filter((j) => !jobRunning(j) && !before.some((b) => b.id === j.id && !jobRunning(b))) : [];
+    for (const j of finished) {
+      if (j.state === 'done') toast(j.message || t('{name} installed', { name: j.name }), 'ok');
+      else if (j.state === 'failed') toast(`${j.name}: ${j.message}`, 'error');
+    }
+    if (changed || finished.length) {
+      loadContent();
+      // (the read takes seconds on a big content folder, #4016)
+      const done = finished.filter((j) => j.state === 'done').map((j) => j.id);
+      if (done.length) set({ settling: [...S.settling, ...done] });
+      rereadUntil('mods', 'mods_status').then(() => done.length && set({ settling: S.settling.filter((id) => !done.includes(id)) }));
+    }
+  } catch {
+    /* the next look */
+  }
+  polling = false;
+}
+
+function startPolling() {
+  pollNow();
+  setInterval(() => {
+    followClock();
+    // (faster while something happens)
+    const busy = S.poll.jobs.some(jobRunning);
+    const every = S.poll.instances?.length && !document.hasFocus() ? 20000 : 4000;
+    if (busy || Date.now() % every < 1000) pollNow();
+  }, 1000);
+  on('games-ended', () => {
+    set({ gameStarted: false });
+    pollNow();
+    loadProfiles();
+    loadSituations();
+    loadDepot();
+    reloadSettings();
+  });
+  window.addEventListener('focus', () => {
+    reloadSettings();
+    pollNow();
+  });
+}

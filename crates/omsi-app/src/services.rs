@@ -2,6 +2,28 @@
 
 use super::*;
 
+/// The weather a bus is made in for the launcher's previews (the showroom and
+/// `--export-glb`): 22 °C, and the absolute humidity of half-saturated air at that
+/// temperature (g/m³).
+const PREVIEW_TEMPERATURE: f32 = 22.0;
+const PREVIEW_ABS_HUMIDITY: f32 = 9.7;
+
+/// Make the next vehicles on a mild day. A preview has no map and no weather: made without
+/// one a bus stood at 0 °C, and the heating scripts that read `Weather_Temperature` in
+/// {init} set it up for a cold day - the Kajosoft Citaros and the 628 fog every window up
+/// below 10 °C (`para_*` in cockpit.osc), so the launcher showed them misted over.
+pub(crate) fn preview_weather() {
+    omsi_sim::host::set_ambient_weather(PREVIEW_TEMPERATURE, PREVIEW_ABS_HUMIDITY);
+}
+
+/// Studio weather belongs to this host, not the ambient weather of a running game.
+pub(crate) fn preview_host(clock: omsi_sim::SimClock) -> omsi_sim::VehicleHost {
+    let mut host = omsi_sim::VehicleHost::new(clock);
+    host.temperature = PREVIEW_TEMPERATURE;
+    host.abs_humidity = PREVIEW_ABS_HUMIDITY;
+    host
+}
+
 /// `--export-glb`: the vehicle alone, no map, written as glTF.
 pub(crate) fn run_export(args: &Args, out: &PathBuf) -> Result<()> {
     let bus = args
@@ -11,6 +33,7 @@ pub(crate) fn run_export(args: &Args, out: &PathBuf) -> Result<()> {
     let path = player_bus_path(&args.root, &bus)?;
     let vt = Arc::new(omsi_sim::VehicleType::load(&args.root, &path)?);
     let scheme = paint_scheme(&vt, args.paint.as_deref());
+    preview_weather();
     let mut host = omsi_sim::VehicleHost::new(start_clock(args));
     host.paint_scheme = Some(scheme);
     let mut vehicle = omsi_sim::VehicleInstance::new(vt.clone(), host);
@@ -23,8 +46,8 @@ pub(crate) fn run_export(args: &Args, out: &PathBuf) -> Result<()> {
     export::export_glb(&args.root, &vt, &vehicle, scheme, out)
 }
 
-/// Does the vehicle's box overlap one of the loaded `[petrolstation]` objects? That is
-/// OMSI's test for the pump, the wash and a repair without travel time.
+/// Does the vehicle's box overlap one of the loaded `[petrolstation]` or `[depot]` objects?
+/// That is OMSI's test for the pump, the wash and a repair without travel time.
 pub(crate) fn at_petrol_station(world: &World, v: &omsi_sim::VehicleInstance) -> bool {
     let f = crate::lan::footprint_of(v, [2.5, 11.5, 3.0, 0.0, 0.0, 1.5]);
     let me = omsi_sim::collision::Obb {
@@ -38,8 +61,9 @@ pub(crate) fn at_petrol_station(world: &World, v: &omsi_sim::VehicleInstance) ->
         pole: None,
         id: -1,
     };
-    let stations = world.petrol_stations.lock();
-    if omsi_cfg::env::var_os("OMSI_DEBUG_SERVICES").is_some() {
+    let data = world.data.peek();
+    let stations = &data.lists.petrol_stations;
+    if omsi_cfg::flags::OMSI_DEBUG_SERVICES.is_set() {
         for p in stations.iter() {
             log::info!("petrol station box at ({:.1}, {:.1}) {:.1} x {:.1} m: bus {:.1} m away", p.center.x, p.center.y, p.half.x * 2.0, p.half.y * 2.0, me.separation(p));
         }
@@ -122,6 +146,7 @@ mod tests {
             model_dir: PathBuf::new(),
             program: Arc::new(program),
             meshes: Vec::new(),
+            lod_meshes: Vec::new(),
             paint_schemes: Vec::new(),
             texchanges: Vec::new(),
             wheel_meshes: Vec::new(),

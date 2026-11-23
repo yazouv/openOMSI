@@ -27,7 +27,8 @@ pub fn open(url: &str) -> Arc<StreamBuf> {
         .name("radio".into())
         .spawn(move || run(&b, &url));
     if let Err(e) = spawned {
-        buf.set_status(format!("cannot start the radio: {e}"));
+        log::warn!("radio: cannot start the radio: {e}");
+        buf.set_status("cannot start the radio");
     }
     buf
 }
@@ -36,7 +37,7 @@ fn run(buf: &StreamBuf, url: &str) {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(8))
         .timeout_read(Duration::from_secs(15))
-        .user_agent(concat!("openOMSI/", env!("CARGO_PKG_VERSION")))
+        .user_agent(&format!("openOMSI/{}", option_env!("OPENOMSI_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))))
         .build();
     let mut wait = 2u64;
     while !buf.is_closed() {
@@ -48,7 +49,7 @@ fn run(buf: &StreamBuf, url: &str) {
                     return;
                 }
                 log::warn!("radio {url}: {e}");
-                buf.set_status(format!("no signal ({e})"));
+                buf.set_status("no signal");
             }
         }
         // the connection ended or failed: try again, less often the longer it fails
@@ -103,6 +104,8 @@ fn play(agent: &ureq::Agent, buf: &StreamBuf, url: &str) -> anyhow::Result<()> {
         Some(n) if n > 0 => Box::new(IcyReader { inner: reader, every: n, left: n, title: title.clone() }),
         _ => reader,
     };
+    // (a new connection: what the last one said of the station counts no longer)
+    buf.set_meta(&name, "");
     let mss = MediaSourceStream::new(Box::new(ReadOnlySource::new(reader)), Default::default());
     let mut hint = Hint::new();
     if ctype.contains("mpeg") || ctype.contains("mp3") {
@@ -163,6 +166,7 @@ fn play(agent: &ureq::Agent, buf: &StreamBuf, url: &str) -> anyhow::Result<()> {
         );
         let now = {
             let t = title.lock();
+            buf.set_meta(&name, &t);
             if t.is_empty() { name.clone() } else { t.clone() }
         };
         let status = if buf.is_playing() { now } else { "buffering …".to_string() };

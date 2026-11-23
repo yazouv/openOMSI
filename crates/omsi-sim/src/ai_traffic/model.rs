@@ -1,0 +1,1078 @@
+//! The AI cars and what the simulation keeps about them, and the helpers that put a
+//! vehicle on its way.
+
+use super::*;
+
+/// Pulling out onto the other half of the road round something standing in the lane.
+#[derive(Debug, Clone, Copy)]
+pub struct Passing {
+    /// The lane of the oncoming traffic the car moves over onto.
+    pub lane: usize,
+    /// How far to the left that lane lies (m).
+    pub side: f32,
+    /// Odometer reading at which the car is past the obstacle and moves back.
+    pub until: f32,
+    /// Odometer reading at which the car's front would reach the obstacle (had it stayed in
+    /// its lane): until then it can still give up and stop behind it.
+    pub block: f32,
+    /// Length of the S-curve back into the lane (m).
+    pub back: f32,
+    /// Given up because somebody came the other way: back in and stopping at the odometer
+    /// reading `hold`.
+    pub aborted: bool,
+    pub hold: f32,
+    /// Started from a standstill close behind the obstacle: the car edges out
+    /// (`PULL_OUT_ACCEL`) until its front is past the obstacle's corner.
+    pub creep: bool,
+}
+
+impl Passing {
+    /// Odometer reading at which the car has moved back far enough to be out of the way of
+    /// the oncoming traffic (`half_width` its own half width).
+    pub fn clear_at(&self, half_width: f32) -> f32 {
+        self.until
+            + self.back * crate::traffic::ramp_progress_for(self.side, half_width + ONCOMING_ROOM)
+    }
+}
+
+/// Room an oncoming vehicle needs beside a car (m from the car's side to the middle of the
+/// oncoming lane): its half width and a margin.
+pub const ONCOMING_ROOM: f32 = 1.15;
+
+/// What makes a new car a timetable bus (`Traffic::create_car`).
+pub struct BusSetup {
+    /// The trip's lanes, as far as the loaded tiles have them.
+    pub route: Vec<usize>,
+    pub stops: Vec<super::bus_service::Stop>,
+    /// Fleet number and registration (`number`, `ident` string variables).
+    pub number: Option<(String, String)>,
+    pub hof: Option<Arc<omsi_vehicle::Hof>>,
+    pub timetable: super::bus_service::AiTimetable,
+}
+
+pub struct AiCar {
+    /// Stable id for references from other systems (passengers).
+    pub id: u64,
+    /// The random seed it was made with and its paint scheme: a car that goes out of range
+    /// and comes back is the same car (`DormantCar`).
+    pub seed: u64,
+    pub scheme: Option<usize>,
+    pub state: AiState,
+    pub vehicle: VehicleInstance,
+    /// The body following the way `state` lays out.
+    pub body: AiBody,
+    /// Seconds this car has been standing still without a stop of its own: a red light or
+    /// a queue is seconds, a jam that never clears grows without bound.
+    pub stopped: f32,
+    /// The car it follows now (its id), when one is close ahead.
+    pub lead_car: Option<u64>,
+    /// A car it does not take for its lead until the time given: two that had each other
+    /// for their lead (see `Traffic::break_lead_pairs`).
+    pub ignore_lead: Option<(u64, f64)>,
+    /// Seconds it has crept along below 1 m/s (a claim of one that crawls in a jam of its
+    /// own is no car about to come either).
+    pub crawl: f32,
+    /// The odometer when it last got two metres further, and the seconds since: a car
+    /// that creeps against something it never gets past stands as much as one that stops
+    /// (`stopped` starts afresh with every centimetre it creeps).
+    pub progress: (f32, f32),
+    /// A timetable bus: its trip's stops, the doors, the layover, the people aboard (see
+    /// `bus_service`). Everything else about it is this car's.
+    pub bus: Option<Box<BusService>>,
+    /// Half the vehicle's width (m).
+    pub half_width: f32,
+    /// Waiting at a junction for someone with the right of way this frame.
+    pub yielding: bool,
+    /// It waited at its junction's line last frame for room on the exit.
+    pub exit_wait: bool,
+    /// Stopped by a red light this frame.
+    pub light_hold: bool,
+    pub since_player_at_light: f32,
+    /// Junction lanes this car has claimed to drive through (`TPathInfo::reservePaths`).
+    pub reserved: Vec<usize>,
+    /// The light (controller, lamp) the driver decided to pass on yellow.
+    pub amber: Option<(usize, usize)>,
+    /// That decision was taken standing first at the light's line as it went green.
+    pub amber_start: bool,
+    pub passing: Option<Passing>,
+    /// The current light and the car's random choice for approaching it on yellow.
+    pub current_light: Option<(usize, usize)>,
+    pub amber_decision: f32,
+    /// Finished (a dead end, the end of a timetable trip, given up): taken off the road as
+    /// soon as nobody can see it.
+    pub gone: bool,
+    /// Seconds since it was put on the road are fewer than this: its speed was a guess.
+    pub fresh: f32,
+    /// The car it lets go first at the next merge (by id).
+    pub merge_after: Option<u64>,
+    /// What holds it (`OMSI_DEBUG_TRAFFIC`, for cars standing for long).
+    pub holding: Option<String>,
+    /// What held the car back this frame (for OMSI_TRACE_AI): the constraint nearest ahead
+    /// ("lead", "light", "yield", "merge", "keep_back", "people", "pull_out", "service",
+    /// "end", "" for none) and its distance ahead of the front (m).
+    pub why: (&'static str, f32),
+    /// Something made it wait this frame: a stop point, or a car or an obstacle close ahead.
+    pub held: bool,
+    /// The vehicle (by id) whose body stands in this car's way off its lanes this frame
+    /// (`Traffic::body_in_way`).
+    pub geo_block: Option<u64>,
+    /// What it keeps behind (by id) and the gap to it, as of its last step.
+    pub lead_info: Option<(u64, f32)>,
+    /// What it waited for at its last junction (`OMSI_DEBUG_STUCK` only).
+    pub junction_why: String,
+    /// Giving way: where it waits (distance from its origin to the line).
+    pub wait_at: Option<f32>,
+    /// The vehicle (by id) standing half out of the lane that this car is squeezing past.
+    pub squeeze: Option<u64>,
+    /// How far behind something standing (a bus at its stop, the player's bus) this car
+    /// stops, so that it can steer out round it later (m, front bumper to the other's body;
+    /// from its own steering, `pull_out_room`).
+    pub pass_room: f32,
+    /// No new look at passing before this time (a pull-out that did not clear the corner is
+    /// not tried again every frame).
+    pub pass_retry: f32,
+    /// The traffic light it waited for in the last frame: distance from its origin.
+    pub light_at: Option<f32>,
+    /// A car that was parked at the kerb: seconds it still stands there, indicating, before
+    /// it pulls out (see `Traffic::pull_out_parked`).
+    pub pull_out: f32,
+    /// Parking: the free space it drives into (see `Traffic::park_in`).
+    pub park: Option<ParkPlan>,
+    /// A rail vehicle: the track it has come along, (odometer, point), oldest first -
+    /// where its rear bogie and its coupled cars and sections run (see `rail_behind`).
+    pub rail_trail: std::collections::VecDeque<(f64, DVec3)>,
+    /// Seconds its body and script took last frame (heavy ones get an AI job of their own).
+    pub ai_secs: f32,
+    /// Seconds of steps its scripts have not been run for yet: they run once a frame (see
+    /// `TrafficSim::scripts_due`), with all the time since they last ran.
+    pub script_owed: f32,
+    /// A train turned round as a whole (its last car leads now): what a trip's
+    /// `[trainreverse]` is compared with (Omsi.exe's vehicle +0x4e1).
+    pub consist_reversed: bool,
+    /// The vehicle (by id) it stands for this frame: the car ahead, the one it gives way
+    /// to at a junction (`stats::WAITS_ON_PLAYER` the player's or a LAN player's). The
+    /// waits-for graph of the traffic statistics.
+    pub waits_on: Option<u64>,
+    /// The vehicle (by id) it gave way to at its junction this frame.
+    pub yield_to: Option<u64>,
+    /// Its sideways moves (`lateral`): what it wishes, its last lane change.
+    pub sideways: super::lateral::Sideways,
+    /// Its body's watch over the scenery (see `scenery`).
+    pub guard: super::scenery::SceneryGuard,
+    /// Chosen to end a circle of cars that all only give way to each other (`deadlock`):
+    /// until this time the right of way does not hold it at its junction (bodies, people,
+    /// lights and a full exit still do).
+    pub yield_pass: f32,
+    /// Junction lanes it has driven off whose claim it keeps while its tail is still on
+    /// them: (lane, odometer reading when its origin left the lane).
+    pub tail_claims: Vec<(usize, f32)>,
+    /// How far its body reaches back from its origin (m): `AiState::rear`, or the rear of
+    /// its last section for an articulated bus or a car with a trailer.
+    pub tail: f32,
+    /// The room it has been promised on its junction's exit: (exit lane, metres, the
+    /// odometer reading at which it gets to the exit).
+    pub exit_claim: Option<(usize, f32, f32)>,
+    /// Everybody it waits for at its junction this step, and why (the waits-for graph of
+    /// `deadlock`).
+    pub holds: Vec<(u64, super::deadlock::Hold)>,
+    /// It goes from a side road's line into a slow queue that lets it in (`junctions`):
+    /// the queue holds back for it while it holds its claim.
+    pub courtesy: bool,
+    /// Its horn (`horn`): presentation only.
+    pub horn: super::horn::Horn,
+    /// Making way for an emergency vehicle coming up behind (`emergency`).
+    pub make_way: Option<super::emergency::MakeWay>,
+}
+
+/// A free parking space beside a lane that a car means to park in: the space of parked car
+/// `key` that drove off (its object comes back when the car is in).
+#[derive(Debug, Clone, Copy)]
+pub struct ParkPlan {
+    pub key: i64,
+    pub lane: usize,
+    /// The space's middle along the lane and its offset to the right of it (m).
+    pub s: f32,
+    pub lat: f32,
+    /// Moving over into the space.
+    pub ramped: bool,
+    /// In the space and standing: the parked object takes its place at the next sync.
+    pub done: bool,
+}
+
+impl AiCar {
+    /// A timetable bus (in service or on its way off after its trip).
+    pub fn is_bus(&self) -> bool {
+        self.bus.is_some()
+    }
+
+    /// Bound to rails (a train, a tram).
+    pub fn is_rail(&self) -> bool {
+        self.body.kind == MotionKind::Rail
+    }
+
+    /// A train (`is_train`), which asks a level crossing from far off.
+    pub fn is_train(&self) -> bool {
+        is_train(&self.vehicle.ty.def)
+    }
+
+    /// Boarding at a stop: the script is told to open the doors (`AI_Scheduled_AtStation`).
+    pub fn at_station(&self) -> bool {
+        self.bus.as_ref().map(|b| b.at_station()).unwrap_or(false)
+    }
+
+    /// The side's doors to open at the stop it is boarding at (`AI_Scheduled_AtStation_Side`).
+    pub fn at_station_side(&self) -> f32 {
+        self.bus
+            .as_ref()
+            .map(|b| b.at_station_side())
+            .unwrap_or(0.0)
+    }
+
+    /// Standing at one of its stops (doors open, waiting for the departure, pulling out).
+    pub fn at_stop(&self) -> bool {
+        self.bus.as_ref().map(|b| b.at_stop()).unwrap_or(false)
+    }
+
+    pub fn trip_done(&self) -> bool {
+        self.bus.as_ref().map(|b| b.trip_done()).unwrap_or(false)
+    }
+
+    pub fn route_open(&self) -> bool {
+        self.bus.as_ref().map(|b| b.route_open).unwrap_or(false)
+    }
+
+    /// The next stop: (route index, distance along that lane).
+    pub fn next_stop(&self) -> Option<(usize, f32)> {
+        self.bus.as_ref()?.stops.front().map(|s| (s.ri, s.s))
+    }
+
+    /// Seconds it will still stand at its stop.
+    pub fn standing_for(&self, day_time: f64) -> f32 {
+        self.bus
+            .as_ref()
+            .map(|b| b.standing_for(day_time))
+            .unwrap_or(0.0)
+    }
+}
+
+/// Where a vehicle's body stands, for the checks that go by geometry rather than by lanes:
+/// the car it belongs to (a trailer or rear section counts as its own footprint), centre,
+/// forward and right unit vectors, half length, half width and speed along its heading.
+#[derive(Debug, Clone, Copy)]
+pub struct Footprint {
+    pub car: usize,
+    pub center: DVec2,
+    pub fwd: DVec2,
+    pub right: DVec2,
+    pub half_len: f64,
+    pub half_w: f64,
+    pub speed: f32,
+    /// Height of the vehicle's origin (an aircraft overhead is not in a car's way).
+    pub z: f64,
+}
+
+/// A car's own footprint, grown forward by `ahead` metres.
+pub fn car_foot(c: &AiCar, ahead: f32) -> Footprint {
+    let st = &c.state;
+    let h = c.vehicle.heading.to_radians();
+    let (fwd, right) = (DVec2::new(h.sin(), h.cos()), DVec2::new(h.cos(), -h.sin()));
+    let center = c.vehicle.position.truncate() + fwd * ((st.front + ahead - st.rear) * 0.5) as f64;
+    Footprint {
+        car: usize::MAX,
+        center,
+        fwd,
+        right,
+        half_len: ((st.front + ahead + st.rear) * 0.5) as f64,
+        half_w: c.half_width as f64,
+        speed: st.speed,
+        z: c.vehicle.position.z,
+    }
+}
+
+impl Footprint {
+    pub fn from_obb(car: usize, b: &crate::collision::Obb, speed: f32) -> Footprint {
+        let (sh, ch) = (b.heading.sin(), b.heading.cos());
+        Footprint {
+            car,
+            center: b.center,
+            fwd: DVec2::new(sh, ch),
+            right: DVec2::new(ch, -sh),
+            half_len: b.half.y,
+            half_w: b.half.x,
+            speed,
+            z: b.z0,
+        }
+    }
+
+    /// The footprint as a collision box (no height range).
+    pub fn obb(&self) -> Obb {
+        Obb {
+            center: self.center,
+            half: DVec2::new(self.half_w, self.half_len),
+            heading: self.fwd.x.atan2(self.fwd.y),
+            z0: f64::MIN,
+            z1: f64::MAX,
+            velocity: DVec2::ZERO,
+            mass: 0.0,
+            pole: None,
+            id: -1,
+        }
+    }
+
+    /// Does this footprint overlap `o`, both grown by `margin` (separating axes)?
+    pub fn overlaps(&self, o: &Footprint, margin: f64) -> bool {
+        let d = o.center - self.center;
+        for axis in [self.fwd, self.right, o.fwd, o.right] {
+            let extent = |f: &Footprint| {
+                (f.fwd.dot(axis)).abs() * (f.half_len + margin)
+                    + (f.right.dot(axis)).abs() * (f.half_w + margin)
+            };
+            if d.dot(axis).abs() > extent(self) + extent(o) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The player's vehicle as the traffic sees it: centre, heading (deg), half length, half
+/// width, speed along the heading (m/s, negative when reversing).
+pub type PlayerBox = (DVec3, f64, f32, f32, f32);
+
+/// A train: a `.ovh` of `[type] 2` (the A3 underground, the OHE railcar, the regional
+/// trains). A tram is rail-bound too but no train: it asks its lights as a car does.
+pub fn is_train(def: &omsi_vehicle::Vehicle) -> bool {
+    matches!(def.kind, omsi_vehicle::VehicleKind::Other(2))
+}
+
+/// The player's rail vehicle on the track, set before each `tick`: the rail lane, the
+/// distance along it, whether it faces the lane's direction, and whether it is a train.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerRail {
+    pub lane: usize,
+    pub s: f32,
+    pub along: bool,
+    pub train: bool,
+}
+
+/// A random car out of the player's range: still on the map and still driving, but without
+/// a body, a script or a picture - a few numbers. It comes back as the same car (type,
+/// paint, id) where it has got to when the player comes near, and it only ever leaves the
+/// map at the end of the road network. Before, every car out of range was simply taken
+/// away and new ones made up around the player: the traffic followed the player about, and
+/// a car driven past was never seen again.
+pub struct DormantCar {
+    pub id: u64,
+    pub ty: Arc<VehicleType>,
+    pub kind: LaneKind,
+    pub lane: usize,
+    pub s: f32,
+    pub speed: f32,
+    pub seed: u64,
+    pub scheme: Option<usize>,
+    /// Its own dice for the turns it takes.
+    pub walk: u64,
+}
+
+/// `[boundingbox]` of a vehicle that gives none.
+pub const DEFAULT_BOX: [f32; 6] = [2.5, 12.0, 3.0, 0.0, 0.0, 1.5];
+
+/// The bodies of a vehicle and of the parts coupled to it, where they stand.
+pub fn vehicle_bodies(v: &VehicleInstance) -> Vec<crate::collision::Obb> {
+    let mut out = vec![crate::collision::Obb::from_box(
+        v.ty.def.bounding_box.unwrap_or(DEFAULT_BOX),
+        v.position,
+        v.body_heading(),
+    )];
+    for t in &v.trailers {
+        out.push(crate::collision::Obb::from_box(
+            t.ty.def.bounding_box.unwrap_or(DEFAULT_BOX),
+            t.position,
+            t.body_heading(),
+        ));
+    }
+    out
+}
+
+/// A timetable bus's IBIS moves on to its next stop as the driver would press it on: the
+/// stock scripts' interior displays, announcements and side displays read `IBIS_busstop`
+/// (an index into the depot file's stop list of the route), which nothing moved on an AI
+/// bus - its saloon display stood on the first stop for the whole trip. `remaining` is the
+/// number of stops still to come.
+pub fn ibis_to_next_stop(v: &mut VehicleInstance, remaining: usize) {
+    let Some(ri) = v.var("IBIS_RouteIndex").filter(|r| *r >= 0.0) else {
+        return;
+    };
+    let Some(n) = v
+        .host
+        .hof
+        .as_ref()
+        .and_then(|h| h.info_busstop_lists.get(ri as usize))
+        .map(|l| l.len())
+    else {
+        return;
+    };
+    if n == 0 || v.var("IBIS_busstop").is_none() {
+        return;
+    }
+    let idx = n.saturating_sub(remaining.max(1)).min(n - 1);
+    v.set_var("IBIS_busstop", idx as f32);
+}
+
+/// How a vehicle on lanes of `kind` moves.
+pub fn motion_kind(kind: LaneKind) -> MotionKind {
+    match kind {
+        LaneKind::Air => MotionKind::Air,
+        LaneKind::Rail => MotionKind::Rail,
+        _ => MotionKind::Road,
+    }
+}
+
+/// How much track an AI rail vehicle keeps behind it (m): a long train's length.
+pub const RAIL_TRAIL: f64 = 400.0;
+
+/// Note where an AI rail vehicle is: `odometer` (m) and the point of its way there. A jump
+/// (put somewhere else, turned round at a terminus) starts the trail afresh.
+pub fn record_rail_trail(
+    trail: &mut std::collections::VecDeque<(f64, DVec3)>,
+    odometer: f64,
+    here: DVec3,
+) {
+    if let Some(&(u, p)) = trail.back() {
+        if (here - p).truncate().length() > (odometer - u).abs() + 2.0 {
+            trail.clear();
+        } else if (odometer - u).abs() <= 0.5 {
+            return;
+        }
+    }
+    // (backing up takes the trail back with it)
+    while trail.back().is_some_and(|b| b.0 > odometer) {
+        trail.pop_back();
+    }
+    trail.push_back((odometer, here));
+    while trail.front().is_some_and(|f| odometer - f.0 > RAIL_TRAIL) {
+        trail.pop_front();
+    }
+}
+
+/// The point of an AI rail vehicle's track `d` metres behind its origin: on the trail it
+/// came along. (Its way knows only the lane it came off; farther back it runs straight on,
+/// and a train's last cars stood beside the track after a pair of points.) Where the trail
+/// does not reach - the last half metre, a vehicle just put there - the way.
+pub fn rail_behind(
+    trail: &std::collections::VecDeque<(f64, DVec3)>,
+    state: &AiState,
+    net: &Network,
+    d: f64,
+) -> DVec3 {
+    let u = state.odometer as f64 - d;
+    let newest = trail.back().map_or(f64::MIN, |b| b.0);
+    if u >= newest {
+        return state.way_point(net, -d as f32);
+    }
+    point_at(trail, u).unwrap_or_else(|| state.way_point(net, -d as f32))
+}
+
+/// The trail's point at travelled distance `u` (between its samples; None beyond its ends).
+/// (The same as the player's train's `rail_drive::point_at`.)
+pub fn point_at(trail: &std::collections::VecDeque<(f64, DVec3)>, u: f64) -> Option<DVec3> {
+    let i = trail.iter().position(|(v, _)| *v >= u)?;
+    if i == 0 {
+        return (trail[0].0 - u < 0.01).then_some(trail[0].1);
+    }
+    let (a, b) = (trail[i - 1], trail[i]);
+    let t = ((u - a.0) / (b.0 - a.0).max(1e-6)).clamp(0.0, 1.0);
+    Some(a.1 + (b.1 - a.1) * t)
+}
+
+/// The track behind a rail vehicle just put at `s` on `lane` (odometer `odometer` there), as a
+/// trail it could have come along: back along its lane, then on into the lane before it that
+/// runs on most nearly straight, a metre at a time (past as many short lanes as a metre takes).
+pub fn rail_track_behind(
+    net: &Network,
+    lane: usize,
+    s: f32,
+    odometer: f64,
+) -> std::collections::VecDeque<(f64, DVec3)> {
+    let mut points = Vec::new();
+    let (mut lane, mut s) = (lane, s.max(0.0));
+    let mut d = 0.0f64;
+    'walk: while d <= RAIL_TRAIL {
+        points.push((odometer - d, net.lanes[lane].at(s).0));
+        s -= 1.0;
+        // (a bounded number of lanes: a loop of lanes without length would never end)
+        for _ in 0..64 {
+            if s >= 0.0 {
+                break;
+            }
+            let start = net.lanes[lane].headings.first().copied().unwrap_or(0.0);
+            let before = net
+                .prev
+                .get(lane)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&p| net.lanes[p].kind == LaneKind::Rail)
+                .min_by(|&a, &b| {
+                    let turn = |p: usize| {
+                        crate::traffic::wrap_deg(
+                            start - net.lanes[p].headings.last().copied().unwrap_or(start),
+                        )
+                        .abs()
+                    };
+                    turn(a).total_cmp(&turn(b))
+                });
+            let Some(p) = before else { break 'walk };
+            s += net.lanes[p].length();
+            lane = p;
+        }
+        if s < 0.0 {
+            break;
+        }
+        d += 1.0;
+    }
+    points.into_iter().rev().collect()
+}
+
+/// A body for a vehicle that has just been put on the way `state` describes, with the
+/// vehicle posed on it.
+pub fn place_body(
+    net: &Network,
+    state: &AiState,
+    vehicle: &mut VehicleInstance,
+    kind: MotionKind,
+) -> AiBody {
+    let mut body = AiBody::new(&vehicle.ty.def, kind);
+    let ground = vehicle.ground.clone();
+    let contact = vehicle.contact.clone();
+    body.place(
+        &|d| state.way_point(net, d),
+        ground
+            .as_ref()
+            .map(|g| g.as_ref() as &dyn Fn(f64, f64) -> Option<f64>),
+        contact.as_deref(),
+        state.speed,
+    );
+    body.apply(vehicle);
+    body
+}
+
+/// The vehicle's extent from its origin: (to the front bumper, to the rear bumper, half
+/// the width) from its `[boundingbox]`.
+pub fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
+    let (front, rear, width) = match ty.def.bounding_box {
+        Some(bb) if bb[1] > 1.0 => (
+            bb[1] * 0.5 + bb[4],
+            bb[1] * 0.5 - bb[4],
+            (bb[0] * 0.5).max(0.5),
+        ),
+        // without a `[boundingbox]` the model's own box, as Omsi.exe takes it (0x7b5da4):
+        // the Berlin S-Bahn's cars, 18 m long, counted as 12 m ones
+        _ => match ty.model_box() {
+            Some((lo, hi)) if hi.y - lo.y > 1.0 => {
+                (hi.y.max(0.5), (-lo.y).max(0.5), (hi.x.max(-lo.x)).max(0.5))
+            }
+            _ => (length * 0.5, length * 0.5, 0.9),
+        },
+    };
+    if crate::vehicle::body_reversed(&ty.def, false) {
+        (rear, front, width)
+    } else {
+        (front, rear, width)
+    }
+}
+
+/// The `ai_reaction` setting applied to a driver's reaction time. Factor 1.0 leaves it as
+/// drawn; a smaller one shortens it, but never under `PULL_OUT_WAIT` (the shortest reaction
+/// the junction and pull-out code is built for), and never raises a reaction that was drawn
+/// under that floor.
+pub fn scale_reaction(reaction: f32, factor: f32) -> f32 {
+    if !factor.is_finite() || (factor - 1.0).abs() < 1e-3 {
+        return reaction;
+    }
+    let floor = crate::ai_motion::PULL_OUT_WAIT.min(reaction);
+    (reaction * factor).max(floor)
+}
+
+/// The driver of a random car: how fast, how close, how patient (see `AiState`).
+pub fn personality(state: &mut AiState, seed: u64, heavy: bool, rowdy_factor: Option<(f32, f32)>) {
+    let ru = |k: u32| ((seed >> k) & 0xff) as f32 / 255.0;
+    let rg = |k: u64| random::draw_gaussian(seed, 50000 + k);
+
+    let rowdy = rowdy_factor.map(|(a, b)| {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        lo + (hi - lo) * ru(3)
+    });
+
+    state.desire = if let Some(r) = rowdy {
+        // OMSI 2: -1.0 -> 87%, 0.0 -> 110%, +1.0 -> 131%
+        let base = if r < 0.0 {
+            1.10 + r * 0.23
+        } else {
+            1.10 + r * 0.21
+        };
+        if heavy {
+            // A lorry or a bus keeps a slower cruise, with floor at 0.80 to hold timetable, capped at 1.0.
+            (0.93 + (base - 1.10) + 0.02 * rg(3)).clamp(0.80, 1.0)
+        } else {
+            (base + 0.02 * rg(3)).clamp(0.5, 2.0)
+        }
+    } else if heavy {
+        (0.93 + 0.05 * rg(3)).clamp(0.8, 1.2)
+    } else {
+        (1.01 + 0.11 * rg(3)).clamp(0.7, 1.3)
+    };
+
+    let r_bias = rowdy.map(|r| r.clamp(-1.5, 1.5)).unwrap_or(0.0);
+
+    state.headway = (1.4 - 0.15 * r_bias + 0.2 * rg(11)).max(0.8);
+    state.min_gap = (1.6 - 0.2 * r_bias + 1.4 * ru(19)).max(1.0);
+    state.accel = if heavy {
+        (0.8 + 0.4 * ru(27) + 0.15 * r_bias).max(0.5)
+    } else {
+        (1.3 + 1.0 * ru(27) + 0.25 * r_bias).max(0.6)
+    };
+    state.decel = if heavy {
+        1.6
+    } else {
+        (2.0 + 0.8 * ru(35) + 0.2 * r_bias).max(1.0)
+    };
+    state.accept_gap =
+        (4.0 - 0.4 * r_bias + 1.0 * rg(43)).max(if rowdy.is_some() { 1.5 } else { 2.0 });
+    state.reaction = (0.8 - 0.1 * r_bias + 0.2 * rg(51)).max(0.2);
+
+    state.honk_factor =
+        (1.0 - 0.25 * r_bias + 0.2 * rg(8)).max(if rowdy.is_some() { 0.1 } else { 0.2 });
+    state.amber_factor = (0.03 + 0.02 * r_bias + 0.01 * rg(9)).clamp(0.0, 0.2);
+    // the hardest braking of ordinary driving: a lorry's or a bus's driver stays further
+    // under the emergency stop's ceiling than a car's
+    let r2 = (((seed >> 7) ^ (seed >> 41)) & 0xff) as f32 / 255.0;
+    state.ordinary_brake = if heavy { 4.5 } else { 4.6 + 0.8 * r2 };
+}
+
+/// Cruising speed of an AI aircraft where its flight path sets no limit (km/h): an
+/// airliner on its final approach.
+pub const AIRCRAFT_KMH: f32 = 280.0;
+
+/// Recognize AI bicycles by their vehicle files, not their mass: motorcycles can be
+/// lighter than the 0.3-ton stock bicycles (#2959). Keep the stock HC/HH20 Fahrrad
+/// and Bicycle names compatible, including the generic bike.ovh filename.
+pub fn is_bicycle(def: &omsi_vehicle::Vehicle) -> bool {
+    let path = def.path.to_string_lossy().to_ascii_lowercase();
+    path.rsplit(['/', '\\']).take(2).any(|part| {
+        part.contains("fahrrad")
+            || part.contains("bicycle")
+            || part.contains("bicicleta")
+            || matches!(part, "bike" | "bike.ovh")
+    })
+}
+
+#[cfg(test)]
+mod rail_track_tests {
+    use super::*;
+    use crate::traffic::LaneBuilder;
+
+    /// A tram put 10 m into a straight that follows a 30 m bend to the right: the track behind
+    /// it runs back round the bend, not on along the straight's line, and not into another
+    /// lane that meets the bend's end at a right angle.
+    #[test]
+    fn a_tram_put_on_its_track_has_the_bend_behind_it() {
+        let mut net = Network::default();
+        let r = 30.0;
+        let bend_len = r * std::f64::consts::FRAC_PI_2;
+        net.lanes.push(LaneBuilder::arc(
+            DVec3::ZERO,
+            0.0,
+            bend_len,
+            r,
+            0.0,
+            LaneKind::Rail,
+            1.5,
+        ));
+        net.lanes.push(LaneBuilder::arc(
+            DVec3::new(r, r, 0.0),
+            90.0,
+            50.0,
+            0.0,
+            0.0,
+            LaneKind::Rail,
+            1.5,
+        ));
+        net.lanes.push(LaneBuilder::arc(
+            DVec3::new(r, 0.0, 0.0),
+            0.0,
+            r,
+            0.0,
+            0.0,
+            LaneKind::Rail,
+            1.5,
+        ));
+        net.prev = vec![Vec::new(), vec![2, 0], Vec::new()];
+        let trail = rail_track_behind(&net, 1, 10.0, 500.0);
+        assert_eq!(
+            trail.back().map(|t| t.0),
+            Some(500.0),
+            "it ends where the tram stands"
+        );
+        let back = |d: f64| point_at(&trail, 500.0 - d).unwrap();
+        let on_bend =
+            |p: DVec3| ((p - DVec3::new(r, 0.0, 0.0)).truncate().length() - r).abs() < 0.3;
+        assert!(
+            on_bend(back(25.0)) && on_bend(back(40.0)),
+            "round the bend: {} {}",
+            back(25.0),
+            back(40.0)
+        );
+        assert!((back(5.0).y - r).abs() < 0.01, "on its own straight first");
+    }
+
+    /// Lanes shorter than the metre between two points of the trail are crossed in one go:
+    /// the trail runs on through them into the long lane behind, on the line of the track.
+    #[test]
+    fn the_track_behind_runs_through_short_lanes() {
+        let mut net = Network::default();
+        let mut y = 0.0;
+        for len in [20.0, 0.3, 0.4, 10.0] {
+            net.lanes.push(LaneBuilder::arc(
+                DVec3::new(0.0, y, 0.0),
+                0.0,
+                len,
+                0.0,
+                0.0,
+                LaneKind::Rail,
+                1.5,
+            ));
+            y += len;
+        }
+        net.prev = vec![Vec::new(), vec![0], vec![1], vec![2]];
+        let trail = rail_track_behind(&net, 3, 5.0, 500.0);
+        for back in 0..=20 {
+            let p = point_at(&trail, 500.0 - back as f64).unwrap();
+            let want = 25.7 - back as f64;
+            assert!(
+                p.x.abs() < 0.01 && (p.y - want).abs() < 0.01,
+                "{back} m back: {p}, not y = {want}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bicycle_tests {
+    use super::is_bicycle;
+    use omsi_vehicle::Vehicle;
+
+    #[test]
+    fn stock_bicycles_are_identified_independently_of_mass() {
+        for path in [
+            "Vehicles/HC_Fahrrad/HC_Fahrrad.ovh",
+            "Vehicles/HH20_Fahrrad/fahrrad.ovh",
+            "Vehicles/Bicycle/bike.ovh",
+            "Vehicles/Bicicleta/bicicleta.ovh",
+            "Vehicles\\Bicycle\\bike.ovh",
+        ] {
+            let def = Vehicle {
+                path: path.into(),
+                mass: 0.3,
+                ..Default::default()
+            };
+            assert!(is_bicycle(&def), "{path}");
+        }
+    }
+
+    #[test]
+    fn lightweight_motorcycles_and_cars_are_not_bicycles() {
+        for (path, mass) in [
+            ("Vehicles/Motorcycles/Honda_CG_125.ovh", 0.125),
+            ("Vehicles/Motorcycles/Road_Bike_125.ovh", 0.15),
+            ("Vehicles/Motorcycles/Scooter.ovh", 0.3),
+            ("Vehicles/Sedan/sedan.ovh", 0.95),
+            ("/home/Bike/OMSI/Vehicles/Sedan/sedan.ovh", 0.95),
+            (
+                "C:\\Bicycle\\OMSI\\Vehicles\\Motorcycles\\scooter.ovh",
+                0.125,
+            ),
+            ("/games/Fahrrad/OMSI/Vehicles/Sedan/sedan.ovh", 0.95),
+        ] {
+            let def = Vehicle {
+                path: path.into(),
+                mass,
+                ..Default::default()
+            };
+            assert!(!is_bicycle(&def), "{path} ({mass} t)");
+        }
+    }
+}
+
+#[cfg(test)]
+mod personality_tests {
+    use super::personality;
+    use crate::traffic::AiState;
+
+    #[test]
+    fn rowdy_factor_influences_speed_desire_and_driving_personality() {
+        let mut slow_st = AiState::new(0, 0.0, 12345);
+        personality(&mut slow_st, 12345, false, Some((-1.0, -1.0)));
+        assert!(
+            (slow_st.desire - 0.87).abs() < 0.06,
+            "desire {:.3} expected ~0.87",
+            slow_st.desire
+        );
+
+        let mut neutral_st = AiState::new(0, 0.0, 12345);
+        personality(&mut neutral_st, 12345, false, Some((0.0, 0.0)));
+        assert!(
+            (neutral_st.desire - 1.10).abs() < 0.06,
+            "desire {:.3} expected ~1.10",
+            neutral_st.desire
+        );
+
+        let mut fast_st = AiState::new(0, 0.0, 12345);
+        personality(&mut fast_st, 12345, false, Some((1.0, 1.0)));
+        assert!(
+            (fast_st.desire - 1.31).abs() < 0.06,
+            "desire {:.3} expected ~1.31",
+            fast_st.desire
+        );
+
+        assert!(fast_st.desire > slow_st.desire);
+        assert!(fast_st.headway < slow_st.headway);
+        assert!(fast_st.accel > slow_st.accel);
+
+        let mut heavy_st = AiState::new(0, 0.0, 12345);
+        personality(&mut heavy_st, 12345, true, Some((0.0, 0.0)));
+        assert!(
+            (heavy_st.desire - 0.93).abs() < 0.06,
+            "desire {:.3} expected ~0.93",
+            heavy_st.desire
+        );
+        assert!(heavy_st.desire < neutral_st.desire);
+
+        let mut heavy_fast = AiState::new(0, 0.0, 12345);
+        personality(&mut heavy_fast, 12345, true, Some((1.0, 1.0)));
+        assert!(
+            heavy_fast.desire <= 1.0,
+            "heavy desire {:.3} should not exceed limit",
+            heavy_fast.desire
+        );
+
+        let mut heavy_slow = AiState::new(0, 0.0, 12345);
+        personality(&mut heavy_slow, 12345, true, Some((-1.0, -1.0)));
+        assert!(
+            heavy_slow.desire >= 0.80,
+            "heavy desire {:.3} should stay at or above 0.80 to hold timetable",
+            heavy_slow.desire
+        );
+    }
+}
+
+impl TrafficSim {
+    /// Put `vehicle` (a random car of type `ty`, or a timetable bus with `bus`) on the road
+    /// on `lane` at `s` metres into it and return its id (see `Traffic::create_car`, which
+    /// makes the vehicle and its picture): its driver, its way, its body. `id` Some = that
+    /// id, `speed` Some = at about that speed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_car(
+        &mut self,
+        mut vehicle: VehicleInstance,
+        kind: LaneKind,
+        lane: usize,
+        s: f32,
+        ty: Arc<VehicleType>,
+        seed: u64,
+        scheme: Option<usize>,
+        id: Option<u64>,
+        speed: Option<f32>,
+        bus: Option<BusSetup>,
+    ) -> u64 {
+        let mut state = AiState::new(lane, s, seed);
+        state.veh_type = if bus.is_some() {
+            -1
+        } else {
+            ty.def.ai_veh_type
+        };
+        if bus.is_none() {
+            state.traffic_pool = self
+                .types
+                .iter()
+                .find(|t| Arc::ptr_eq(&t.0, &ty))
+                .and_then(|t| self.group_uvg[t.3])
+                .map(|pool| (pool, self.uvg_defaults.clone()));
+        }
+        state.plan_next(&self.net);
+        // heavy vehicles (trucks, vans) cruise slower, which is what gets them overtaken
+        let heavy = ty.def.mass > 6.0 || bus.is_some();
+        personality(&mut state, seed, heavy, ty.def.rowdy_factor);
+        state.reaction = scale_reaction(state.reaction, self.reaction_factor);
+        state.max_speed_kmh = if kind == LaneKind::Air {
+            AIRCRAFT_KMH
+        } else if bus.is_some() {
+            // a bus driver keeps to the limit (the town's 50) like the cars round him,
+            // with a little more on the arterial roads
+            56.0 + (seed % 7) as f32
+        } else if heavy {
+            // (a truck keeps to the limit like the cars, up to a truck's own 80-90 km/h: it
+            // took 38-47 on every road, crawling along 80 km/h roads, #327)
+            80.0 + (seed % 10) as f32
+        } else if kind == LaneKind::Street && is_bicycle(&ty.def) {
+            // Stock bicycles stay at 15-21 km/h (#327), without capping light motorbikes (#2959).
+            15.0 + (seed % 7) as f32
+        } else {
+            100.0
+        };
+        // (with the realistic physics a tram or a train pulls as its class does: the pull falls
+        // with speed at the class's power; its brakes and its jerk stay the traffic's)
+        if kind == LaneKind::Rail && crate::rail::realistic() {
+            if let Some(class) = crate::rail::RailClass::of(&ty.def) {
+                state.rail_power = Some(class.performance().kw_per_tonne * 0.85);
+            }
+        }
+        // lorries and vans take bends more gently than cars
+        state.lat_accel = if kind == LaneKind::Air {
+            50.0
+        } else if heavy {
+            1.6
+        } else {
+            2.4 + (seed % 7) as f32 * 0.1
+        };
+        if bus.is_some() {
+            // it brakes for its stops the way the town's drivers brake for a light: with
+            // 1.5 m/s² of "comfortable" braking the planner braked at half that and crept
+            // up to every stop for a hundred metres
+            state.decel = 2.1;
+            state.accel = state.accel.max(1.0);
+            state.min_gap = state.min_gap.max(2.2);
+        }
+        let (front, rear, half_width) = extents(&ty, if bus.is_some() { 12.0 } else { 4.5 });
+        state.front = front;
+        state.rear = rear;
+        state.length = front + rear;
+        if let Some(b) = &bus {
+            state.set_route(&self.net, b.route.clone(), s);
+        }
+        state.speed = (self.net.lanes[lane]
+            .speed_limit_kmh
+            .min(state.max_speed_kmh)
+            / 3.6
+            * 0.7)
+            .min(state.curve_speed(&self.net));
+        if kind == LaneKind::Air {
+            state.speed = self.net.lanes[lane]
+                .speed_limit_kmh
+                .min(state.max_speed_kmh)
+                / 3.6;
+            state.accel = 0.5;
+            state.decel = 0.5;
+        }
+        // a bus put out at a stop stands there (in the bay, if it has one)
+        let at_stop = bus
+            .as_ref()
+            .and_then(|b| b.stops.first())
+            .filter(|st| st.ri == 0 && (st.s - s).abs() < 1.5);
+        if let Some(st) = at_stop {
+            state.speed = 0.0;
+            if st.bay.abs() > 0.01 {
+                state.lateral = st.bay;
+                state.lateral_target = st.bay;
+                state.lateral_ramp = (st.bay, st.bay, 0.0, 1.0);
+            }
+        }
+        let body = place_body(&self.net, &state, &mut vehicle, motion_kind(kind));
+        if omsi_cfg::flags::OMSI_DEBUG_TRAFFIC.is_set() {
+            let pos = vehicle.position;
+            log::info!(
+                "spawn {} on lane {lane} s={s:.1} at ({:.1}, {:.1}, {:.1}) heading {:.0}",
+                ty.def.path.display(),
+                pos.x,
+                pos.y,
+                pos.z,
+                vehicle.heading
+            );
+        }
+        let pass_room = if kind == LaneKind::Street {
+            self.pull_out_room(&ty, front, rear, half_width)
+        } else {
+            0.0
+        };
+        let id = id.unwrap_or_else(|| {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        });
+        if let Some(v) = speed {
+            state.speed = v.min(state.speed.max(v * 0.5));
+        }
+        self.cars.push(AiCar {
+            id,
+            state,
+            vehicle,
+            body,
+            stopped: 0.0,
+            lead_car: None,
+            ignore_lead: None,
+            crawl: 0.0,
+            progress: (0.0, 0.0),
+            bus: bus.map(|b| Box::new(BusService::new(b.stops))),
+            half_width,
+            yielding: false,
+            exit_wait: false,
+            light_hold: false,
+            since_player_at_light: f32::MAX,
+            reserved: Vec::new(),
+            amber: None,
+            amber_start: false,
+            passing: None,
+            current_light: None,
+            amber_decision: 0.0,
+            gone: false,
+            fresh: 1.5,
+            merge_after: None,
+            holding: None,
+            why: ("", 0.0),
+            held: false,
+            geo_block: None,
+            lead_info: None,
+            junction_why: String::new(),
+            wait_at: None,
+            squeeze: None,
+            pass_room,
+            pass_retry: 0.0,
+            light_at: None,
+            pull_out: 0.0,
+            rail_trail: Default::default(),
+            ai_secs: 0.0,
+            script_owed: 0.0,
+            consist_reversed: false,
+            waits_on: None,
+            yield_to: None,
+            sideways: Default::default(),
+            yield_pass: f32::MIN,
+            tail_claims: Vec::new(),
+            tail: 0.0,
+            exit_claim: None,
+            holds: Vec::new(),
+            courtesy: false,
+            horn: Default::default(),
+            make_way: None,
+            park: None,
+            seed,
+            scheme,
+            guard: Default::default(),
+        });
+        if kind == LaneKind::Rail && !self.cars[self.cars.len() - 1].vehicle.trailers.is_empty() {
+            let net = &self.net;
+            let c = self.cars.last_mut().unwrap();
+            c.rail_trail = rail_track_behind(net, lane, s, c.state.odometer as f64);
+            let (trail, state, vehicle) = (&c.rail_trail, &c.state, &mut c.vehicle);
+            vehicle.retrail(0.0, &|d| Some(rail_behind(trail, state, net, d)));
+        }
+        if kind != LaneKind::Air {
+            let i = self.cars.len() - 1;
+            if let Some(gap) = self.red_ahead(i) {
+                let st = &mut self.cars[i].state;
+                st.speed = st.speed.min((2.0 * st.decel * (gap - 1.0).max(0.0)).sqrt());
+            }
+        }
+        id
+    }
+}

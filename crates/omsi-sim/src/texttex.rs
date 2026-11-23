@@ -9,11 +9,23 @@ use omsi_model::TextTexture;
 use std::path::Path;
 use std::sync::Arc;
 
+#[derive(Clone)]
+struct DecodedFontBitmap {
+    width: u32,
+    height: u32,
+    pixels: Arc<[u8]>,
+}
+
 pub struct FontLibrary {
     atlases: HashMap<String, Option<Arc<FontAtlas>>>,
+    // An .oft can describe several sizes using one image. Loading each size must not
+    // decode that image again while scripts wait for the font library's lock.
+    images: HashMap<std::path::PathBuf, Option<DecodedFontBitmap>>,
     root: std::path::PathBuf,
     /// Every `[newfont]` of every content root's `Fonts/*.oft`, in lookup order; read once.
     index: Option<Vec<Font>>,
+    /// The fonts of `root/Fonts` and no other (`only`).
+    only_root: bool,
 }
 
 /// Style words at the end of a font name ("churafont++ 32x8 Bold").
@@ -40,7 +52,14 @@ fn size_of(name: &str) -> Option<(u32, u32)> {
 
 impl FontLibrary {
     pub fn new(root: &Path) -> FontLibrary {
-        FontLibrary { atlases: HashMap::new(), root: root.to_path_buf(), index: None }
+        FontLibrary { atlases: HashMap::new(), images: HashMap::new(), root: root.to_path_buf(), index: None, only_root: false }
+    }
+
+    /// The fonts of `root/Fonts` alone - not of every content folder: one bus's own (another
+    /// player's bus, mounted as its driver has it), which this machine's fonts of the same
+    /// names must not stand in for.
+    pub fn only(root: &Path) -> FontLibrary {
+        FontLibrary { only_root: true, ..FontLibrary::new(root) }
     }
 
     fn index(&mut self) -> &[Font] {
@@ -49,12 +68,13 @@ impl FontLibrary {
             // the installation): a mod's display fonts live in the content folder, and looking
             // only in the installation's `Fonts` left the O530's number plate, matrix and
             // dashboard displays empty. A file of the same name higher up replaces the stock one.
-            let mut files = omsi_cfg::read_dir_merged("Fonts");
+            let mut files = if self.only_root { Vec::new() } else { omsi_cfg::read_dir_merged("Fonts") };
             if files.is_empty() {
                 files = omsi_cfg::vfs::read_dir_paths(&self.root.join("Fonts"));
             }
-            // each folder in root order, its files in name order (a listing comes in the file
-            // system's order)
+            // each folder in root order, its files in the order Windows lists them: Omsi.exe
+            // loads `Fonts\*.oft` as its FindFirst loop meets them (0x6e5e52), and this file
+            // system may hand them over in another
             let mut folders: Vec<std::path::PathBuf> = Vec::new();
             for p in &files {
                 let d = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
@@ -62,10 +82,14 @@ impl FontLibrary {
                     folders.push(d);
                 }
             }
-            files.sort_by_cached_key(|p| (folders.iter().position(|d| Some(d.as_path()) == p.parent()).unwrap_or(usize::MAX), p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()));
-            // Two files of one folder naming the same font: the one read later takes its place,
-            // as in the original (the LiAZ's `ANX_S.oft` spells its "ц" as "=", and a
-            // "ANX_S - копия.oft" lying beside it, read first, left the letter out). A
+            let rank = |p: &Path| folders.iter().position(|d| Some(d.as_path()) == p.parent()).unwrap_or(usize::MAX);
+            let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            files.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| omsi_cfg::collate::cmp_as_listed(&name(a), &name(b))));
+            // Two files of one folder naming the same font: Omsi.exe keeps both and looks a
+            // name up from the front (0x5d6738), so the one listed first is drawn. Our one
+            // exception is a second file drawing on the same alpha bitmap - an edited copy of
+            // the font beside the original: whichever of the two has more letters is drawn
+            // (the LiAZ's `ANX_S - копия.oft`, listed before `ANX_S.oft`, lacks the "ц"). A
             // folder of higher priority keeps its fonts over the folders after it.
             let mut all: Vec<Font> = Vec::new();
             let mut folder_of: Vec<usize> = Vec::new();
@@ -75,18 +99,19 @@ impl FontLibrary {
                 }
                 let folder = folders.iter().position(|d| Some(d.as_path()) == p.parent()).unwrap_or(usize::MAX);
                 // `Font::path` is the .oft (read through the VFS): its bitmaps lie next to it
-                if let Ok(list) = Font::load_all(&p) {
-                    for f in list {
+                match Font::load_all(&p) {
+                    Err(e) => log::warn!("font file {} not read: {e:#}", p.display()),
+                    Ok(list) => for f in list {
                         let key = f.name.trim().to_ascii_lowercase();
                         match all.iter().position(|o| o.name.trim().to_ascii_lowercase() == key) {
-                            Some(k) if folder_of[k] == folder => all[k] = f,
+                            Some(k) if folder_of[k] == folder && same_bitmap_fuller(&all[k], &f) => all[k] = f,
                             Some(_) => {}
                             None => {
                                 all.push(f);
                                 folder_of.push(folder);
                             }
                         }
-                    }
+                    },
                 }
             }
             self.index = Some(all);
@@ -137,9 +162,18 @@ impl FontLibrary {
         Some(sibling.clone())
     }
 
-    /// `get` with the built-in image decoder.
+    /// `get` with the registered picture decoder (`crate::image_decode`).
     pub fn load(&mut self, name: &str) -> Option<Arc<FontAtlas>> {
-        self.get(name, &|p| omsi_texture::decode_file(p).ok().map(|i| (i.width, i.height, i.rgba)))
+        self.get(name, &|p| crate::image_decode::decode(p).ok().map(|i| (i.width, i.height, i.rgba)))
+    }
+
+    fn decoded_image(&mut self, file: std::path::PathBuf, decode: &dyn Fn(&Path) -> Option<(u32, u32, Vec<u8>)>) -> Option<DecodedFontBitmap> {
+        if let Some(image) = self.images.get(&file) {
+            return image.clone();
+        }
+        let image = decode(&file).map(|(width, height, rgba)| DecodedFontBitmap { width, height, pixels: rgba.into() });
+        self.images.insert(file, image.clone());
+        image
     }
 
     /// Fonts are looked up by their `[newfont]` name across all `Fonts/*.oft` files of every
@@ -157,13 +191,16 @@ impl FontLibrary {
             let fonts_dir = f.path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.join("Fonts"));
             let alpha_path = omsi_cfg::resolve_path(&fonts_dir, &f.alpha);
             let color_path = omsi_cfg::resolve_path(&fonts_dir, &f.bitmap);
-            let (aw, ah, alpha) = decode(&alpha_path)?;
-            let color = match (color_path != alpha_path).then(|| decode(&color_path)).flatten() {
-                Some((cw, ch, c)) if (cw, ch) == (aw, ah) => c,
-                Some((cw, ch, c)) if cw > 0 && ch > 0 && c.len() == (cw * ch * 4) as usize => color_at_alpha_pixels(&c, cw, ch, aw, ah),
-                _ => alpha.clone(),
+            let alpha = self.decoded_image(alpha_path, decode)?;
+            let (aw, ah) = (alpha.width, alpha.height);
+            let color = match self.decoded_image(color_path, decode) {
+                Some(c) if (c.width, c.height) == (aw, ah) => c.pixels,
+                Some(c) if c.width > 0 && c.height > 0 && c.pixels.len() == (c.width as usize * c.height as usize * 4) => {
+                    color_at_alpha_pixels(&c.pixels, c.width, c.height, aw, ah).into()
+                }
+                _ => alpha.pixels.clone(),
             };
-            Some(Arc::new(FontAtlas::new(f, aw, ah, color, alpha)))
+            Some(Arc::new(FontAtlas::from_shared(f, aw, ah, color, alpha.pixels)))
         });
         if atlas.is_none() && !name.trim().is_empty() {
             log::warn!("font \"{name}\" not found");
@@ -171,6 +208,16 @@ impl FontLibrary {
         self.atlases.insert(key, atlas.clone());
         atlas
     }
+}
+
+/// `later`, a font of the same name as `kept` in the same folder, is an edited copy of it
+/// that only adds letters (see `FontLibrary::index`): cut from the same alpha bitmap, the same
+/// height, every letter of `kept` at the same place in it, and more of them. A copy that
+/// moves or drops a letter is another font, and Omsi.exe's first one stays.
+fn same_bitmap_fuller(kept: &Font, later: &Font) -> bool {
+    let bitmap = |f: &Font| f.path.parent().map(|d| omsi_cfg::resolve_path(d, f.alpha.trim()).to_string_lossy().to_lowercase());
+    let keeps_every_letter = kept.chars.iter().all(|k| later.chars.iter().any(|c| c.ch == k.ch && (c.x0, c.x1, c.y) == (k.x0, k.x1, k.y)));
+    bitmap(kept) == bitmap(later) && later.height == kept.height && later.chars.len() > kept.chars.len() && keeps_every_letter
 }
 
 /// A font's colour bitmap laid over its alpha bitmap pixel for pixel. Omsi.exe reads a
@@ -193,6 +240,7 @@ fn color_at_alpha_pixels(color: &[u8], cw: u32, ch: u32, aw: u32, ah: u32) -> Ve
 }
 
 /// Runtime state of one `[texttexture]`.
+#[derive(Clone)]
 pub struct TextTextureState {
     pub def: TextTexture,
     pub atlas: Option<Arc<FontAtlas>>,
@@ -232,6 +280,80 @@ impl TextTextureState {
 mod tests {
     use super::*;
 
+    fn bitmap_font(name: &str, folder: &str) -> Font {
+        Font {
+            path: Path::new(folder).join("display.oft"),
+            name: name.into(),
+            bitmap: "shared.bmp".into(),
+            alpha: "shared.bmp".into(),
+            height: 2,
+            chars: vec![omsi_content::font::FontChar { ch: 'A', x0: 0, x1: 1, y: 0 }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn different_fonts_share_pixels_without_sharing_their_metrics() {
+        let mut lib = FontLibrary::new(Path::new("fonts"));
+        let first = bitmap_font("Small", "fonts");
+        let mut second = bitmap_font("Wide", "fonts");
+        second.gap = 3;
+        lib.index = Some(vec![first.clone(), second.clone()]);
+        let reads = std::cell::Cell::new(0);
+        let pixels = vec![255; 16];
+        let decode = |_: &Path| {
+            reads.set(reads.get() + 1);
+            Some((2, 2, pixels.clone()))
+        };
+        let small = lib.get("Small", &decode).unwrap();
+        let wide = lib.get("Wide", &decode).unwrap();
+        assert_eq!(reads.get(), 1);
+        assert!(Arc::ptr_eq(&small.alpha, &wide.alpha));
+        assert!(Arc::ptr_eq(&small.color, &small.alpha));
+        assert_eq!(small.text_width("AA"), 2);
+        assert_eq!(wide.text_width("AA"), 8);
+        for (actual, font) in [(&small, first), (&wide, second)] {
+            let uncached = FontAtlas::new(font, 2, 2, pixels.clone(), pixels.clone());
+            assert_eq!(actual.render("AA", 12, 4, true, [0; 3]), uncached.render("AA", 12, 4, true, [0; 3]));
+        }
+        assert!(Arc::ptr_eq(&small, &lib.get("SMALL", &decode).unwrap()));
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn equal_bitmap_names_in_different_folders_stay_separate() {
+        let mut lib = FontLibrary::new(Path::new("fonts"));
+        lib.index = Some(vec![bitmap_font("Pack A", "pack_a"), bitmap_font("Pack B", "pack_b")]);
+        let reads = std::cell::Cell::new(0);
+        let decode = |p: &Path| {
+            reads.set(reads.get() + 1);
+            Some((2, 2, vec![if p.starts_with("pack_a") { 10 } else { 20 }; 16]))
+        };
+        let a = lib.get("Pack A", &decode).unwrap();
+        let b = lib.get("Pack B", &decode).unwrap();
+        assert_eq!(reads.get(), 2);
+        assert_eq!((a.color[0], b.color[0]), (10, 20));
+        assert!(!Arc::ptr_eq(&a.color, &b.color));
+    }
+
+    #[test]
+    fn failed_images_are_remembered_only_in_this_library() {
+        let fonts = vec![bitmap_font("First", "fonts"), bitmap_font("Second", "fonts")];
+        let mut lib = FontLibrary::new(Path::new("fonts"));
+        lib.index = Some(fonts.clone());
+        let reads = std::cell::Cell::new(0);
+        let missing = |_: &Path| {
+            reads.set(reads.get() + 1);
+            None
+        };
+        assert!(lib.get("First", &missing).is_none());
+        assert!(lib.get("Second", &missing).is_none());
+        assert_eq!(reads.get(), 1);
+        let mut next = FontLibrary::new(Path::new("fonts"));
+        next.index = Some(fonts);
+        assert!(next.get("First", &|_| Some((2, 2, vec![255; 16]))).is_some());
+    }
+
     /// A full-colour font whose colour bitmap is not the alpha's size takes each glyph
     /// pixel's colour from the same pixel of the colour bitmap, as Omsi.exe reads it, not
     /// the alpha's white (#829).
@@ -265,5 +387,26 @@ mod tests {
         assert_eq!(family_of("churafont++ 14x10"), "churafont++ 14x10");
         assert_eq!(family_of("Bold"), "bold");
         assert_eq!(family_of("LEERFELD"), "leerfeld");
+    }
+
+    #[test]
+    fn an_edited_copy_on_the_same_bitmap_wins_only_with_more_letters() {
+        let font = |file: &str, alpha: &str, letters: &str| Font {
+            path: Path::new("Fonts").join(file),
+            name: "Matrix 8x5".into(),
+            alpha: alpha.into(),
+            height: 8,
+            chars: letters.chars().map(|ch| omsi_content::font::FontChar { ch, x0: 0, x1: 4, y: 0 }).collect(),
+            ..Default::default()
+        };
+        let original = font("matrix.oft", "matrix_a.tga", "ABC");
+        assert!(same_bitmap_fuller(&original, &font("matrix (2).oft", "MATRIX_A.tga", "ABCD")));
+        assert!(!same_bitmap_fuller(&original, &font("matrix (2).oft", "matrix_a.tga", "AB")));
+        assert!(!same_bitmap_fuller(&original, &font("matrix big.oft", "matrix_big.tga", "ABCDEFG")));
+        // more letters, but one of the original's gone or another height: not a copy
+        assert!(!same_bitmap_fuller(&original, &font("matrix (3).oft", "matrix_a.tga", "ABDE")));
+        let mut taller = font("matrix (4).oft", "matrix_a.tga", "ABCD");
+        taller.height = 9;
+        assert!(!same_bitmap_fuller(&original, &taller));
     }
 }

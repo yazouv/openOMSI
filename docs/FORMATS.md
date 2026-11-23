@@ -82,7 +82,7 @@ trunc ! /-/` (negate); `d` duplicates. `pi` pushes π, `random` replaces `st[0]`
 whole number in `[0, n)` with `n = |round(st[0])|` (the exe calls `Random(Abs(Round(x)))`). A reached `{else}` jumps to the next `{endif}` even when a stray `{endif}` has already closed its
 `{if}` (the Procity's dashboard script has one; ignoring that `{else}` blanked its odometer every
 frame). `$SetLengthL n` keeps the left n characters or pads on the right, `$SetLengthR n` keeps the
-right n or pads on the left (read off the exe's `str_SetLengthL/R`); re-checked Sept 24 2026 in `TXPC_calcblock_func` op 0x25 at 0x5d584a: `Copy(s, len-n+1, n)`). Mod scripts that cannot show what they were written for under these semantics are patched before compiling by `omsi_script::compat` (recognised by their text: the LiAZ 5292's 4-character line matrix pads the line to `4 $SetLengthL` and then keeps `3 $SetLengthR`, which left lines 1-9 blank and 5E as `   E`; its number is now written `"03" $IntToStrEnh` → `005E`). `{if}` does **not** pop its condition (28 spots in the stock scripts
+right n or pads on the left (read off the exe's `str_SetLengthL/R`); re-checked Sept 24 2026 in `TXPC_calcblock_func` op 0x25 at 0x5d584a: `Copy(s, len-n+1, n)`). Unlike `$cutBegin`/`$cutEnd`, the three `$SetLength*` ops leave n on the number stack (the executor at 0x5d4a50 pops first only for the ops in its bit set at 0x5d5bac; the Kruger++ matrix display uses n again). Mod scripts that cannot show what they were written for under these semantics are patched before compiling by `omsi_script::compat` (recognised by their text: the LiAZ 5292's 4-character line matrix pads the line to `4 $SetLengthL` and then keeps `3 $SetLengthR`, which left lines 1-9 blank and 5E as `   E`; its number is now written `" 3" $IntToStrEnh` (padded with spaces, not zeros) → `  5E`. Aachen's ibox keeps route digits in float `ibox_eingabe` and blanks the display at 0, so leading zeros never appeared; mode-10 route entry uses a string digit buffer on `ibox_Zahleingabe` (empty until typed — no `"00"` / `"02" $IntToStrEnh` auto-pad): typed `0` then `1` shows `01`, typed `1` alone shows `1`; mode-7 line entry stays empty for free typing with no auto leading zeros). `{if}` does **not** pop its condition (28 spots in the stock scripts
 work on it: `(L.L.bremse_feststell) {if} ! (S.L.bremse_feststell)` releases the parking brake,
 `cond {if} (L.L.IBIS_busstop) 0 > &&` in the IBIS; the chura matrix writes `x d -1 = ! {if} *`).
 Tokens found in the executable's operator table: `/-/ <= >= && || sin arcsin arctan min max exp
@@ -118,7 +118,9 @@ operators compiles to nothing, silently (a lone `$`, `$=>`, `$++`, `$SetLengthM`
 another unknown word is an error.
 
 Constfiles: `[const] name value`, `[newcurve] name` followed by `[pnt] x y` (piece-wise linear,
-clamped). Varlists / stringvarlists: one name per line. A `(F.L.name)` whose curve no constfile
+clamped). Constants and curves each keep the first definition of a name (ASCII
+case-insensitive), both within a constfile and across constfiles in their listed order.
+Varlists / stringvarlists: one name per line. A `(F.L.name)` whose curve no constfile
 defines is logged as `SC_ErrorInCommand_functioninvalid` and still takes its argument, giving
 0 (the O530 Facelift's ZF-6AP-1300/1700 lack two converter curves that its `zf-eco.osc` uses
 in the line that computes `M_Wheel`).
@@ -173,6 +175,22 @@ frame and each object's placement in its own frame. Normals go by the inverse tr
 Ruede Trafohaus scales its frame unevenly). 27 stock scenery `.x` files have translated frames
 (the Verkehrszeichen_MC street name signs, Ruede's chestnut trees, bus stop poles and old
 shelter, Trafohaus, Buildings_MC's wohn_03/04 and hoch_01).
+
+**Binary `.x`** (`xof 0303bin 0032`, or `0064` for double floats) holds the same objects as
+little-endian tokens, each a WORD: 1 name and 2 string (DWORD length, then the bytes; a string
+is followed by its `,`/`;` token as a DWORD), 3 integer, 5 GUID (16 bytes), 6 integer list and
+7 float list (DWORD count, then the values), 10-20 the marks `{ } ( ) [ ] < > . , ;`,
+31 `template`, 40-52 the template member types. `omsi-o3d` reads both encodings through one
+token stream; the compressed `tzip`/`bzip` variants are refused. Mod scenery exported this way
+(the PAD-Labs houses) loads like the text files.
+
+**DeclData** inside a `Mesh` carries per-vertex data as a Direct3D 9 vertex declaration: a
+count and that many D3DVERTEXELEMENT9 entries (type, method, usage, usage index), then a
+count of DWORDs holding the vertex buffer, the elements packed one after another in each
+vertex (floats as their bit patterns). The first NORMAL and the first TEXCOORD set replace
+`MeshNormals` / `MeshTextureCoords`; packed types (DEC3N, SHORT2N, FLOAT16_2, ...) widen to
+floats as Direct3D 9 does. Without it such meshes (the PAD-Labs houses, the Köln trees) come
+out in one flat colour.
 
 **Scrambled vertices (version ≥ 4).** The `key` field (`0xFFFFFFFF` = none) selects a vertex
 scrambling reproduced from the original loader (`omsi-o3d`):
@@ -296,7 +314,10 @@ far end at the spline's end, 3 and 4 the near end at its start, otherwise each p
 third value moves it past the end. A `.sli` without `[terrainholeprofile]` gets one per
 string of joined `[profile]`s (0x5ab908): its left end and right end 3 cm in and 3 mm
 down, a bottom 10 cm under its lowest point reaching 0.5 m past both ends. An outline
-that crosses itself cuts nothing. Each `[terrainhole] <mesh.o3d>` in a `.sco` or model.cfg names an
+that crosses itself cuts nothing. openOMSI does not cut this outline out of the drawn ground
+where the aligned spline lies in a trough: it fills the trough with solid ground instead, and
+cuts the outline as Omsi.exe does where the saved ground stands above the spline (a cutting)
+or where that fill cannot be built. Each `[terrainhole] <mesh.o3d>` in a `.sco` or model.cfg names an
 object-wide cutter, including declarations before the first `[mesh]` and repeated commands.
 The cutter sits next to its declaring file or in its `model` folder; declarations in a `.sco`
 also apply when it references a separate model.cfg. Explicit cutters apply even to deep
@@ -357,7 +378,9 @@ whole spline at that offset; lanes of consecutive splines meet at the ends.
 
 12 lines (`path_2`: 14): start x, y, z in the object frame (x right, y forward, z up),
 heading (degrees, clockwise, relative to the object), radius (0 straight, > 0 right turn),
-length, 0, height change, kind (0 street, 1 sidewalk, 2 rail), width, direction (0/1/2 as
+length, gradient at the start and at the end (rise per metre: the height runs as their
+integral along the path - checked on the stock objects, where 50 of 53 linked paths meet
+the next one's start height that way, #1617), kind (0 street, 1 sidewalk, 2 rail), width, direction (0/1/2 as
 above), turn indicator (0 none, 2 left, 3 right; used for the AI blinkers); `path_2` adds two
 zero fields. Verified on `Einm_Spandauer_Koelner_1990.sco`: the arc `(1.5,-7.75) h0 r6.248
 l4.635` ends exactly at the start of the next path `(3.142,-3.529) h42.5`.
@@ -366,6 +389,15 @@ index n; `[traffic_light] name` + `[phase] state seconds` (0 red, 3 red+yellow, 
 8 yellow, 9 all-red; the last `0 0` phase = red until the `[traffic_lights_group]` cycle
 restarts). `[trafficlight]` lamp objects are placed with map flag 1, the extra line = light
 index, and `[varparent] id` = the crossing; their `[visible] red|yellow|green 1` meshes follow.
+
+`[traffic_light_stop] light time ifAnf` and `[traffic_light_jump] light time ifAnf target`
+are points on that cycle clock. `ifAnf` 1 makes the condition "nobody is asking at `light`",
+0 "somebody is asking". A stop normally holds the clock **just before** its time, so the
+phase that ends there stays shown; if the clock is already at the stop (within 1e-6 s
+either side) it holds there. A stop never holds in a red-and-yellow changeover: if the
+instant just before the stop is red-and-yellow, the clock holds at the stop's own time;
+a stop whose own time is red-and-yellow is passed. A jump whose condition holds at the
+same cycle time as a stop is taken first, and the stop is left behind.
 
 ## Timetables (`TTData`)
 
@@ -454,13 +486,17 @@ an object's own z = 0), and leaves out one wholly under it (`omsi_render::SmokeP
 model wherever it stands). With d the distance to the camera and z the depth along the view:
 the object is dropped when `d > R + maxObjDist` or `(z − R) / maxObjDist > 1` (both skipped by
 `[noDistanceCheck]`), and when `size / D < minObjSize` where
-`size = 2R / (z · fov · π/180)` - the object's diameter over its depth as a share of the
+`size = 2R / (d · fov · π/180)` - the object's diameter over its distance as a share of the
 camera's vertical field of view (degrees, camera +0x38). The same `size` (not divided by D)
 chooses the `[LOD]` level, so the `[LOD]` values of a model are in this measure. The values
 come from `options.cfg`: `[performance_maxObjDist]` (750 in the shipped file, 900 in the high
 presets, 1200 for Chicago), `[performance_minObjSize]` (0.013; 0.020 in "PC 2006") and, for
 reflections, `[performance_minObjSizeRefl]` (0.046). A detail factor above 1 therefore makes
 an object vanish sooner (clutter), below 1 keeps it longer.
+
+Rechecked on OMSI 2.2.032: 0x5fdde4 takes d with `D3DXVec3Length` and 0x5fde54..0x5fde89
+compute `size` from it; there is no exception for a camera inside the sphere, so `size` stays
+finite there.
 
 **`[LOD]` choice (OMSI 0x5ef860, Sept 2026).** Each `[LOD] x` appends x to the model's list and
 makes its index the level of the meshes after it. With that `size`, OMSI takes the *first*
@@ -593,7 +629,8 @@ rim the reflection running on away from the camera.
   `coll_pos_z` < 1.10 (vehicle frame, m) - so `coll_pos_*` is where the bodies meet, down at
   the bumpers, not the height of the centre of gravity.
 * Engine callbacks the stock scripts still needed: `(M.V.GetHeightAbovePoint)` takes x y z in
-  the vehicle frame and returns how high that point stands over the ground below it
+  the vehicle frame and returns how high that point stands over the first face a ray meets
+  coming down from 3 m above it, -3 at the least and 1000 with nothing there
   (positive with room underneath: the NL/NG lift may drop by it, up to 0.3 m, and the Solaris
   Urbino's kneeling sensor reads under 0.05 once the body touches the kerb - its level
   control vents the right-hand bellows only above that); `(M.V.GetHumanCountOnPathLink)`
@@ -616,8 +653,8 @@ rim the reflection running on away from the camera.
   180° were `.x` meshes read with transposed frames); text is centred and squeezed to fit.
   A `[texttexture]` whose variable is one of the object's script string variables (the stock
   stop departure displays) is drawn from the script whenever it calls `Refresh_Strings`.
-  `[helparrow]` objects (route arrows a map's author puts up) are drawn only while OMSI 2's
-  route arrows are on (`nav_arrows`, the game menu's "Route arrows"), as in Omsi.exe.
+  `[helparrow]` objects are shown by *Map-placed route arrows* (`nav_map_arrows`). The game
+  can show these independently of the dynamic arrows it generates from the driven route.
 * `[matl_envmap]`: the reflectivity mask is the diffuse alpha; textures without an alpha
   channel (DXT1 paint schemes such as the GN92 HVL livery) do not reflect at all.
 
@@ -630,6 +667,13 @@ set_camera_outside_center schwerpunkt rollwiderstand rot_pnt_long inv_min_turnra
 newachse (achse_long achse_maxwidth achse_minwidth achse_raddurchmesser achse_feder achse_maxforce
 achse_daempfer achse_antrieb achse_inertia_inv) number registration_automatic registration_list
 registration_free kmcounter_init + model/script/sound/paths/passengercabin.
+openOMSI's own blocks (read the same way, `key value` lines to the next block): `[trolley_pole]`,
+`[trolley_rheostat]`, `[trolley_async]`, `[trolley_battery]`, `[trolley_aux]`, `[trolley_vars]`,
+`[trolley_none]`: the poles on the roof and the traction drive of a trolleybus, or none of the
+game's own for a vehicle that moves its poles itself (OMSI 2 has none: its trolleybus
+add-ons run a plugin beside the game). Every key, the variables the game writes for models and
+the map's `trolley.txt` (`[trolley_net]`, `[trolley_section]`, `[trolley_span]`,
+`[trolley_switch]`, `[trolley_insulator]`) are in [TROLLEYBUS.md](TROLLEYBUS.md).
 Built-in vehicle variables are listed in `program/varlist_roadvehicle.txt`; generated per axle:
 `Wheel_Rotation_ Wheel_RotationSpeed_ Axle_Steering_ Axle_Suspension_ Axle_Springfactor_
 Axle_Brakeforce_ Axle_SurfaceID_` × `{n}_{L|R}`, `PAX_Entry{n}_Open/_Req`, `PAX_Exit{n}_…`,
@@ -700,6 +744,14 @@ onlytypes end types_prefered number_tour.
   Hz and is silent below DirectSound's 100 Hz. The rear section of an articulated bus has
   its own `[sound]` (on a pusher the engine is there) and plays it on the shared scripts'
   triggers and variables.
+* The player's bus's outside entries heard in its cab (`[viewpoint]` without 2) come in at
+  `Snd_OutsideVol` of their volume as in Omsi.exe, and openOMSI also takes their treble away
+  through what is shut: a low-pass at some 500 Hz with everything closed, rising evenly in
+  octaves to the whole range at `Snd_OutsideVol` 0.95 and none from there (Omsi.exe has no
+  filter; the traffic heard from the cab keeps it as Omsi.exe does, `0.2 + Snd_OutsideVol`
+  of its volume). Walking in or out through a door, the cab's entries and the street's are
+  mixed by how far inside the bus's box the eyes are (0.4 m in: all cab), and the traffic's
+  cab level with them.
 * `AutoClutch` (system variable) is 1 unless the options say `[no_automaticClutch]`: the
   manual-gearbox scripts (F90, T3, the Sprinter, PAZ and LAZ mods) work their clutch
   themselves then; at 0 a gear put in without the clutch pedal is thrown out at once.
@@ -779,8 +831,10 @@ Regional = https://example.org/regional.mp3 | 97.9
   resolution reduction and the compression switch of the options dialog (not verified);
   `[texmemlimit]` (401.0 in the stock file) is the texture memory in MB above which OMSI
   lowers the resolution of distant textures. openOMSI's own keys are
-  `texture_compression=` (on by default) and `texture_memory=` (MB; `texmemlimit=` is read
-  too; an eighth of the machine's memory when unset). `OMSI_NO_BC=1` uploads everything as
+  `texture_compression=` (on by default) and `video_memory=` (MB for everything the game
+  holds on the card, not the textures alone; nine tenths of a discrete card's memory when
+  unset). `[texmemlimit]` and openOMSI's old `texture_memory=` were texture budgets: they
+  are not imported and the launcher drops `texture_memory=` when it writes the file. `OMSI_NO_BC=1` uploads everything as
   RGBA, `OMSI_NO_TEXCOMPRESS=1` keeps DXT files as blocks and the rest RGBA.
 
 ## Lighting (envir.cfg, model lights)
@@ -798,7 +852,32 @@ Regional = https://example.org/regional.mp3 | 97.9
   after the far `[LOD] 0` mesh, and no stock model repeats a light in two levels.
 * `[spotlight]` (vehicle): pos, dir, rgb, range, inner, outer; the active one is chosen by the
   `Spot_Select` variable (negative = none). `[spotlight_2]` (openOMSI, see MODDING.md): the same twelve
-  numbers, a switching variable and a no-mirror flag; any number lit at once. `[interiorlight] variable range r g b x y z`.
+  numbers, a switching variable and a no-mirror flag; any number lit at once. `[spotlight_cookie]`
+  (openOMSI, below): a lamp whose beam is a picture. `[interiorlight] variable range r g b x y z`.
+* `[spotlight_cookie]` (openOMSI; Omsi.exe skips it): a lamp whose light is a picture of its
+  beam - the beam as it would show on a wall square to the lamp, its brightness and colour every
+  way within the field the picture covers. One value a line: x, y, z (the lamp, vehicle frame:
+  x right, y ahead, z up), the direction's x, y, z, red, green, blue (0..255, the picture's
+  colours times these), range (m, as a `[spotlight]`'s: 100 is a low beam's reach, more reaches
+  further), the whole angle the picture covers across and up and down (degrees), the picture
+  (looked for as the model's textures are), the switching variable (0 off, 1 full, in between
+  dimmed; a number is a constant). Three more lines may follow, each where given (a blank line or
+  the next keyword ends the block): the seconds it takes to come to 63 % of a new brightness
+  (0 at once), a variable that turns it to the right about the vehicle's up axis (degrees: a
+  cornering lamp) and one that turns it up about its own horizontal axis (degrees: headlamp
+  levelling). The picture's right is the lamp's right seen from behind it, its top up; where it
+  is white the lamp is as bright as a headlamp's beam at its strongest, black is no light, and
+  nothing reaches outside its field. Only the enhanced picture draws the picture, eight
+  different pictures (or fields) at once at most, each taken down to 64 x 64; a lamp beyond
+  them, one whose picture is missing, and the classic picture light the cone round the picture
+  instead. A lamp aimed along the road on the player's vehicle shares the headlamps' shadow
+  (see below). A rear section's model may have its own; their variables are the bus's.
+* Shadows of the player's headlamps (Enhanced, with shadows on): the lamps on
+  the front of the player's vehicle that light the road (the `[spotlight]` `Spot_Select` picks,
+  `[spotlight_2]` and `[spotlight_cookie]` lamps aimed along the road) are taken together as one
+  source between them and get one of the four shadow maps the street lamps share, looking along
+  the road from there: what stands in their light throws its shadow ahead. The vehicle's own
+  parts cast none into it.
 * `[maplight] x y z r g b radius` (scenery): point light at night, full within `radius`,
   inverse-square beyond, out of range at six times it. The colour is the brightness: a petrol
   station's red sign declares 0.1 red over a 20 m core and is meant to glow by its pumps, not
@@ -809,7 +888,16 @@ Regional = https://example.org/regional.mp3 | 97.9
 ## Script textures and the IBIS callbacks
 
 `[scripttexture] w h` (model.cfg) declares an RGBA image per index; `[useScriptTexture] n`
-puts it on a material, `[matl_transmap] \S:n` uses its alpha as transparency map. The
+puts it on a material, `[matl_transmap] \S:n` uses its alpha as transparency map.
+`[htmltexture] w h file` declares a page the engine draws (see `HTMLTEXTURE.md`); `lit` on
+the line after the page's path makes it a **surface** - shaded by the world's light as every
+other material is, on every slot that shows the page, a scenery object's or a vehicle's -
+where a page is a display, drawn unlit at its own brightness, by default.
+An openOMSI extension; Omsi.exe draws such a slot unlit either way.
+`[navigatortexture] w h [variable] [mapScale] [fixedNorth] [noNavUI] [navCenter] [showHistory]`
+declares a screen the game's navigator draws its small map
+on, while the optional variable is not 0 (see `NAVIGATORTEXTURE.md`); `[useNavigatorTexture] n`
+puts the n-th on a material. Also an openOMSI extension. The
 scripts draw with `(M.V.ST…)` callbacks, arguments pushed in order (index first):
 `STNewTex(i)`, `STLock(i)`, `STUnlock(i)` (upload), `STFilter(i)`, `STSetColor(i, a, r, g, b)`,
 `STDrawPixel(i, x, y)`, `STDrawRect(i, x1, y1, x2, y2)`, `STTextOut(i, x, y, font, mode,
@@ -841,13 +929,20 @@ Depot (.hof) callbacks: `GetRouteIndex(code)` (code = line×100 + route → `[in
 index), `GetRouteTerminusIndex(route)`, `GetTerminusCode(idx)`, `GetTerminusIndex(code)`,
 `GetTerminusString(idx, n)`, `GetBusstopCount(route)`, `GetRouteBusstopIdent(route, k)`,
 `GetBusstopIndex("ident")`, `GetBusstopString(idx, n)`, `GetDepotStringGlobal(n)`.
+openOMSI adds `GetRadioName` and `GetRadioSong` (no arguments, a string each): the bus
+radio's station and title, empty while it is off.
 `[addterminus]`/`[addterminus_allexit]` records are code, ident, then `stringcount_terminus`
 strings (no separate station line in any shipped file). AI buses get their destination the
 original way: string `SetLineTo` + `AI_target_index` (terminus index) and the
-`ai_scheduled_settarget` trigger. Depot callbacks with index -1 (what the lookups answer for an
-unknown code) return "" / -1, never entry 0. A depot file belongs to a map: when the bus folder
-has none of the name the map's `ailists.cfg` wants (a mod bus brings only its own map's), the
-openOMSI takes it from another vehicle folder (`omsi_vehicle::hof::depot_anywhere`). The FloFix
+`ai_scheduled_settarget` trigger - and, as every trip a bus starts calls
+`TRoadVehicleInst.virtual_10`, also when the depot file has no row for the trip's terminus or
+the group names no depot file at all (`AI_target_index` stays as it was). Depot callbacks with
+index -1 (what the lookups answer for an unknown code) return "" / -1, never entry 0. A depot
+file belongs to a map: when the bus folder has none of the name the map's `ailists.cfg` wants
+(a mod bus brings only its own map's), openOMSI takes it from another vehicle folder
+(`omsi_vehicle::hof::depot_anywhere`); a bus of a plain `[aigroup_2]` pool, whose group names
+no depot, takes the map's depot of its folder where it has one, else the folder's first
+(`schedule::pool_depot`, Omsi.exe's selected-hof index 0). The FloFix
 "Atron" IBIS of many mods starts in a PIN mode (`IBIS_mode` 10) and wants the `PIN` constant
 of its constfile typed and confirmed before the mode keys work.
 
@@ -965,3 +1060,35 @@ items are washer water / condensation that only exist while the variable is on;
 the variant and add `texture × emissive` self-illumination (lower-deck lighting).
 `[matl_lightmap]` is a light *mask* multiplied with the diffuse texture (the SD202 maps
 `D86_02_L1.bmp` are grey masks of the lit atlas regions), scaled by its variable.
+
+`[matl_glow] <texture> <value>` is **an openOMSI extension** (Omsi.exe's model unit has no
+such keyword and skips it as it skips any unknown line; no stock content uses it): it makes the
+slot **its own light**. The named texture is a **greyscale mask** of how much shines where
+(white full, black none) and the light is the material's **own colour** - a destination
+panel's text keeps the colour its display draws. `value` is its brightness on the scale of the
+LED panels' `Led glow` setting (the shader's strength is `value * 0.25`, as that setting's
+levels are): `6` is as bright as that setting's default, `20` brighter than its top. The setting
+itself does not scale it. Only the enhanced picture draws it, as an emission held against the
+metering as an LED panel's dots are, so it shows by day as well as by night; the glare round it
+comes from how bright it is, as any light's does. An unlit slot (a script's or a text texture,
+drawn at its own brightness already) does not take it.
+The mask is bound in the light map's slot: a slot that also has a `[matl_lightmap]` keeps its
+light map and has no glow, and the classic picture draws the slot as if the keyword were not
+there. A glow that is switched (a tail lamp) is a `[matl_item]` of a `[matl_change]` with the
+keyword; an item without a light map or glow of its own keeps its base material's. The last
+`[matl_glow]` of a slot counts.
+
+`[led_glow_effect] <value>` is **an openOMSI extension** too (Omsi.exe skips it): `value`, 0 to
+1, is how much of the `Led glow` setting the slot's lit dots burn with. Without it the enhanced
+picture guesses which slots are LED panels - a `\S:n` script mask (or a page's dot mask) under a
+light map that is white all over - and gives them the whole of the setting; with it the
+modeller decides: `0` the slot is no LED panel (a flipdot or an LCD the guess would take for
+one), anything over 0 it is one, glowing with that share. The dots are what the slot's alpha
+lets through, in its texture's colour, as with the guessed panels. A value outside 0..1 is
+taken to the nearer end. It belongs to the slot like the other commands (the last one counts,
+a `[matl_item]` takes it from the slot or gives its own); the classic picture does not use it.
+
+Commands between `[matl_change]` and its first `[matl_item]` belong to the slot's plain
+material, as Omsi.exe's reader has them (0x5efae8 keeps the slot's record current until the
+item): an LED matrix that opens its change first and writes `[matl_alpha] 2` and its
+`[useScriptTexture]` after it gives them to the panel itself, lit or not.

@@ -3,6 +3,10 @@
 //! DLLs OMSI's plugins are; on Windows the game starts it directly, elsewhere through Wine.
 //!
 //! usage: omsi-plugin-host <library>   (then the protocol of `omsi_plugin::wire` on stdio)
+#[cfg(windows)]
+#[path = "../steam_error_dialog.rs"]
+mod steam_error_dialog;
+
 use omsi_plugin::{wire, Library};
 use std::io::{BufReader, BufWriter, Write};
 
@@ -11,9 +15,11 @@ fn main() {
         eprintln!("usage: omsi-plugin-host <library>");
         std::process::exit(2);
     };
+    #[cfg(windows)]
+    steam_error_dialog::watch(&path);
     let mut input = BufReader::new(std::io::stdin().lock());
-    let mut out = BufWriter::new(std::io::stdout().lock());
-    let lib = match Library::load(std::path::Path::new(&path)) {
+    let mut out = BufWriter::new(protocol_out());
+    let mut lib = match Library::load(std::path::Path::new(&path)) {
         Ok(l) => Some(l),
         Err(e) => {
             eprintln!("omsi-plugin-host: {path}: {e}");
@@ -22,21 +28,34 @@ fn main() {
     };
     loop {
         let Ok(op) = wire::get_u8(&mut input) else { return };
-        let res = match (op, &lib) {
+        let res = match (op, &mut lib) {
             (wire::START, Some(lib)) => {
                 lib.start();
-                let p = lib.procs();
-                let flags = p.variable as u8 | (p.trigger as u8) << 1 | (p.system as u8) << 2 | (p.string as u8) << 3;
-                wire::put_u8(&mut out, 1).and_then(|_| wire::put_u8(&mut out, flags))
+                wire::put_u8(&mut out, 1).and_then(|_| wire::put_u8(&mut out, lib.procs().flags()))
             }
             (wire::START, None) => {
                 let _ = wire::put_u8(&mut out, 0).and_then(|_| wire::put_u8(&mut out, 0)).and_then(|_| out.flush());
                 return;
             }
-            (wire::FRAME, Some(lib)) => match wire::get_frame(&mut input) {
-                Ok(f) => wire::put_reply(&mut out, &lib.frame(&f)),
-                Err(_) => return,
-            },
+            (wire::FRAME, Some(lib)) => {
+                // (the script textures travel only for a library with AccessScriptTexture,
+                // as the game knows from the flags of START)
+                // (and the passengers' tickets only for one with AccessTicketRequest)
+                let (textures, tickets) = (lib.procs().texture, lib.procs().ticket);
+                let frame = wire::get_frame(&mut input, textures, lib.procs().pointer).and_then(|mut f| {
+                    if tickets {
+                        f.tickets = wire::get_tickets(&mut input)?;
+                    }
+                    Ok(f)
+                });
+                match frame {
+                    Ok(f) => {
+                        let reply = lib.frame(&f);
+                        wire::put_reply(&mut out, &reply, textures).and_then(|_| if tickets { wire::put_ticket_answers(&mut out, &reply.tickets) } else { Ok(()) })
+                    }
+                    Err(_) => return,
+                }
+            }
             (wire::FINALIZE, Some(lib)) => {
                 lib.finalize();
                 let _ = wire::put_u8(&mut out, 1).and_then(|_| out.flush());
@@ -50,10 +69,36 @@ fn main() {
     }
 }
 
+#[cfg(windows)]
+fn protocol_out() -> Box<dyn Write> {
+    use std::os::windows::io::AsHandle;
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    unsafe extern "C" {
+        fn _dup2(from: i32, to: i32) -> i32;
+    }
+    let Ok(own) = std::io::stdout().as_handle().try_clone_to_owned() else { return Box::new(std::io::stdout()) };
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
+        _dup2(2, 1);
+    }
+    Box::new(std::fs::File::from(own))
+}
+
+#[cfg(unix)]
+fn protocol_out() -> Box<dyn Write> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::dup(1) };
+    if fd < 0 {
+        return Box::new(std::io::stdout());
+    }
+    unsafe { libc::dup2(2, 1) };
+    Box::new(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// Homebrew's i686 MinGW links no unwinder the prebuilt standard library can use; built
 /// with `panic=abort` nothing unwinds, and this stands in for the one symbol it names.
 #[cfg(all(target_os = "windows", target_arch = "x86", target_env = "gnu"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _Unwind_Resume() -> ! {
     std::process::abort()
 }
