@@ -461,7 +461,9 @@ pub struct Devices {
     hats: Vec<(String, [i8; 8])>,
     /// The buttons of the pads gilrs knows a layout of, by what they are (south, D-pad left)
     /// and not by number: what `gamepad_profile` binds, whatever the system numbers them.
-    pad_buttons: Vec<(String, gilrs::Button, bool)>,
+    /// The number the button has in `gamectrler.cfg` comes along where it is known, to tell
+    /// a button the player bound from one that still drives its default.
+    pad_buttons: Vec<(String, gilrs::Button, Option<usize>, bool)>,
 }
 
 impl Devices {
@@ -634,9 +636,11 @@ impl Devices {
                 let Some(pad) = g.connected_gamepad(ev.id) else {
                     continue;
                 };
-                if let EventType::ButtonPressed(b, _) | EventType::ButtonReleased(b, _) = ev.event {
+                if let EventType::ButtonPressed(b, code) | EventType::ButtonReleased(b, code) = ev.event {
                     if pad.mapping_source() != gilrs::MappingSource::None {
-                        self.pad_buttons.push((pad.name().to_string(), b, matches!(ev.event, EventType::ButtonPressed(..))));
+                        // (gilrs' number is the file's only where the buttons are read through gilrs)
+                        let number = if use_gilrs_buttons(di, is_system_gamepad_kind(pad.name(), gilrs_is_wgi_gamepad(&pad), is_di(&pad))) { button_number(&pad, code) } else { None };
+                        self.pad_buttons.push((pad.name().to_string(), b, number, matches!(ev.event, EventType::ButtonPressed(..))));
                     }
                 }
                 match ev.event {
@@ -1059,14 +1063,14 @@ fn push_xinput_edges(
     name: &str,
     edges: impl IntoIterator<Item = (gilrs::Button, usize, bool)>,
     out: &mut Vec<(String, usize, bool)>,
-    pad_buttons: &mut Vec<(String, gilrs::Button, bool)>,
+    pad_buttons: &mut Vec<(String, gilrs::Button, Option<usize>, bool)>,
 ) {
     for (btn, n, down) in edges {
         if gilrs_edges.iter().any(|(gn, bn, gd)| gn == name && *bn == n && *gd == down) {
             continue;
         }
         out.push((name.to_string(), n, down));
-        pad_buttons.push((name.to_string(), btn, down));
+        pad_buttons.push((name.to_string(), btn, Some(n), down));
     }
 }
 
@@ -1470,15 +1474,15 @@ impl Controllers {
                 None
             };
             if let Some(b) = btn {
-                events.push((name.clone(), b, *down));
+                events.push((name.clone(), b, Some(*n), *down));
             }
         }
-        for (name, button, down) in events {
+        for (name, button, number, down) in events {
             let Some(action) = gamepad_profile::default_action(button) else { continue };
             if self.off(&name) || !find_connected(&connected, &name).is_some_and(|c| c.gamepad) {
                 continue;
             }
-            if find_device_cfg(&self.cfg, &name).is_some_and(|d| d.buttons.iter().any(|b| !b.0.is_empty())) {
+            if !preset_applies(find_device_cfg(&self.cfg, &name), number) {
                 continue;
             }
             self.actions.push((action.to_string(), down));
@@ -1493,7 +1497,7 @@ impl Controllers {
             for (name, n, down) in &self.raw_buttons {
                 log::info!("pad: {name}: button {n} {}", if *down { "down" } else { "up" });
             }
-            for (name, b, down) in &self.devices.pad_buttons {
+            for (name, b, _, down) in &self.devices.pad_buttons {
                 log::info!("pad: {name}: gamepad button {b:?} {}", if *down { "down" } else { "up" });
             }
         }
@@ -1999,6 +2003,20 @@ pub fn find_connected<'a>(connected: &'a [Connected], name: &str) -> Option<&'a 
     connected.iter().find(|c| c.name == name).or_else(|| connected.iter().find(|c| names_match(&c.name, name)))
 }
 
+/// Whether a gamepad button still drives its default (`gamepad_profile`). A pad nobody set
+/// buttons up for keeps all its defaults; once the player binds a button, only that button
+/// stops driving its default and the others go on - binding one button used to take every
+/// default away, leaving a pad that did nothing until each button was set by hand. Where the
+/// button's number in the file is not known, any bound button of the pad turns the defaults
+/// off, as before.
+fn preset_applies(cfg: Option<&DeviceCfg>, number: Option<usize>) -> bool {
+    let Some(cfg) = cfg else { return true };
+    match number {
+        Some(n) => cfg.actions_of(n).is_empty(),
+        None => !cfg.buttons.iter().any(|b| !b.0.is_empty()),
+    }
+}
+
 /// An exact device name wins over a shorter alias elsewhere in the same OMSI file.
 fn find_device_cfg<'a>(cfg: &'a [DeviceCfg], name: &str) -> Option<&'a DeviceCfg> {
     let exact = normalized_device_name(name);
@@ -2421,7 +2439,35 @@ mod tests {
         let mut pad_buttons = Vec::new();
         super::push_xinput_edges(&gilrs_edges, "Xbox One Game Controller", xinput_edges, &mut out, &mut pad_buttons);
         assert_eq!(out, vec![("Xbox One Game Controller".to_string(), 1, false)]);
-        assert_eq!(pad_buttons, vec![("Xbox One Game Controller".to_string(), gilrs::Button::East, false)]);
+        assert_eq!(pad_buttons, vec![("Xbox One Game Controller".to_string(), gilrs::Button::East, Some(1), false)]);
+    }
+
+    #[test]
+    fn binding_one_pad_button_keeps_the_defaults_of_the_others() {
+        use super::{preset_applies, DeviceCfg};
+        let bound = |n: usize, action: &str| {
+            let mut d = DeviceCfg { name: "Pad".into(), ..Default::default() };
+            d.buttons.resize(n + 1, (String::new(), "0".into()));
+            d.buttons[n].0 = action.to_string();
+            d
+        };
+        // a pad nobody set up, or one with no button bound: every default drives
+        assert!(preset_applies(None, Some(0)));
+        assert!(preset_applies(Some(&DeviceCfg { name: "Pad".into(), ..Default::default() }), Some(0)));
+        // button 8 (the left stick's click) bound: the other buttons keep their defaults...
+        let d = bound(8, "horn");
+        assert!(preset_applies(Some(&d), Some(0)));
+        assert!(preset_applies(Some(&d), Some(5)));
+        // ...and the bound one drives what the player chose, not its default
+        assert!(!preset_applies(Some(&d), Some(8)));
+        // a second action on the same button counts as bound as well
+        let mut d = bound(8, "");
+        d.more.push((3, "door_2".into()));
+        assert!(!preset_applies(Some(&d), Some(3)));
+        assert!(preset_applies(Some(&d), Some(0)));
+        // a button whose number is unknown keeps the old rule
+        assert!(!preset_applies(Some(&bound(8, "horn")), None));
+        assert!(preset_applies(Some(&bound(8, "")), None));
     }
 }
 
