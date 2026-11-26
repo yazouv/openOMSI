@@ -12,6 +12,11 @@ pub(crate) struct Args {
     /// settings, no paths, names or log text) to this file and end, without starting the game.
     #[arg(long)]
     pub(crate) export_diagnostics: Option<PathBuf>,
+    /// Write the stop labels of the map's timetable - each stop's name, the lines calling at
+    /// it and where they go from here, from `TTData` - as a CSV, and end, without starting
+    /// the game (#2462: what a `Haltestellenschild` says, for a map's signs).
+    #[arg(long = "export-stop-labels")]
+    pub(crate) export_stop_labels: Option<PathBuf>,
     /// OMSI 2 installation root (the folder that contains `maps`, `Vehicles`, …).
     /// Found by itself when left out: $OMSI_ROOT, the folder remembered from last time,
     /// a folder next to this program, or the usual Steam locations.
@@ -226,6 +231,9 @@ pub(crate) struct Args {
     pub(crate) situation_vars: Vec<(String, f32)>,
     #[arg(skip)]
     pub(crate) situation_strvars: Vec<(String, String)>,
+    /// The coupled cars' own variables in that snapshot (a tram's rear cab).
+    #[arg(skip)]
+    pub(crate) situation_cars: Vec<omsi_content::situation::SituationCar>,
     /// The saved bus odometer, applied after spawning so initialization cannot replace it.
     #[arg(skip)]
     pub(crate) situation_odometer_km: Option<f64>,
@@ -384,6 +392,7 @@ pub(crate) struct SituationOther {
     pub paint: Option<String>,
     pub vars: Vec<(String, f32)>,
     pub strvars: Vec<(String, String)>,
+    pub cars: Vec<omsi_content::situation::SituationCar>,
     pub odometer_km: Option<f64>,
 }
 

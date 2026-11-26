@@ -63,6 +63,8 @@ impl<'a> Offscreen<'a> {
                     &mut scene,
                     traffic.as_mut(),
                     parse_time(&args.time),
+                    // (the player is not there yet: no budget kept on the way)
+                    &[],
                 )
             });
             if let (Some(t), true) = (traffic.as_mut(), omsi_cfg::flags::OMSI_CHECK_TRIPS.is_set())
@@ -129,6 +131,8 @@ impl<'a> Offscreen<'a> {
         }
         // the workshop's waiting time moves the clock on, so the sky has to follow it
         let mut service_seconds = 0.0f64;
+        // (the run's weather for Omsi.exe's daylight from the first step on)
+        omsi_sim::daylight::set_sky_weather(omsi_weather::conditions::daylight_weather(&weather));
         let daylight0 = omsi_sim::Daylight::compute(&start_clock(args), envir.as_ref());
         if let Some(p) = player.as_mut() {
             p.vehicle.set_var(
@@ -221,7 +225,7 @@ impl<'a> Offscreen<'a> {
                     .ok()
                     .as_ref(),
             );
-            steps::set_ai_daylight(t, daylight, steps::gloomy_weather(Some(&weather)));
+            steps::set_ai_daylight(t, daylight);
             t.populate(&world, center);
             crate::view_sync::apply_traffic(
                 t,
@@ -485,25 +489,7 @@ fn new_humans(
         // a dedicated server plays nowhere itself: its people are the LAN players' alone (at
         // the map's camera they filled the whole pool, and the players met nobody)
         h.players_only = args.server.is_some() && player.is_none();
-        h.exact_fare = settings.exact_fare;
-        h.transfer_percent =
-            if args.passenger_connections_allowed(false) && settings.passenger_connections {
-                settings.passenger_transfer_percent
-            } else {
-                0.0
-            };
-        h.visual_hailing = settings.passenger_hailing && settings.passenger_animation == "enhanced";
-        h.visual_full_bus_reaction =
-            settings.passenger_full_bus_reaction && settings.passenger_animation == "enhanced";
-        h.bad_driving = settings.pax_bad_driving;
-        h.boarding = settings.boarding.clone();
-        h.stand_chance = settings.standing_chance;
-        h.short_rides_stand = settings.pax_short_rides_stand;
-        h.voices = match settings.pax_voices.as_str() {
-            "off" => 2,
-            "tickets" => 1,
-            _ => 0,
-        };
+        h.apply_settings(settings, args.passenger_connections_allowed(false));
         if let Some(p) = player.as_mut() {
             h.set_cabin(&mut p.vehicle);
             h.ticket_key = ticket_key_name(&args.root, &p.bindings);

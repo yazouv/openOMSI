@@ -30,6 +30,7 @@ impl App {
         ctl.set_background(self.settings.ctrl_background);
         ctl.set_focus(self.input.window_focused || self.settings.ctrl_background);
         ctl.deadzone = self.settings.ctrl_deadzone;
+        ctl.set_zones(&self.settings.ctrl_deadzone_axes);
         ctl.right_stick_look = self.settings.right_stick_look;
         ctl.pad_deadzone = self.settings.pad_deadzone;
         ctl.pad_presets = self.settings.pad_buttons;
@@ -85,8 +86,10 @@ impl App {
             || !matches!(self.view.as_str(), "driver" | "outside" | "pax");
         let used = moved || actions.iter().any(|a| a.1) || analog.look != [0.0, 0.0];
         self.input.cursor_stale |= used;
-        let hide = (moved || actions.iter().any(|a| a.1))
-            && !needs_mouse
+        // (#1247: with the software cursor there is nothing for Windows to move, so the
+        // system's cursor stays hidden even over the menus)
+        let hide = (self.settings.software_cursor
+            || ((moved || actions.iter().any(|a| a.1)) && !needs_mouse))
             && !vr_on
             && self.input.window_focused;
         if self.xr.vr_nav_edit.is_none()

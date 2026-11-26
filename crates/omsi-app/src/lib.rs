@@ -348,6 +348,14 @@ pub fn run() -> Result<()> {
         println!("Support package written to {} - look inside before you attach it to an issue", out.display());
         return Ok(());
     }
+    // (also without the content and the device: the map's `TTData` is all it reads)
+    if let Some(out) = &args.export_stop_labels {
+        let map_dir = Path::new(&args.map).parent().map(|p| args.root.join(p)).unwrap_or_else(|| args.root.clone());
+        let n = omsi_timetable::stop_labels::export(&map_dir, out)
+            .with_context(|| format!("stop labels of {}", map_dir.display()))?;
+        println!("Stop labels of {} stops written to {}", n, out.display());
+        return Ok(());
+    }
     // Started by a double click or with no arguments at all: that is the launcher's job.
     // The launcher itself runs the game with a full command line (--no-menu, --map, ...).
     let bare = std::env::args().len() == 1;
@@ -680,10 +688,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
 #[rustfmt::skip]
 fn assemble_app(args: Args, settings: settings::Settings) -> App {
     let view = args.view.clone();
-    let args_root_for_keys = args.root.clone();
     let clock_note = args.clock_moved.clone();
-    // (as the last session left it, #1164)
-    let info_bar = settings.info_bar;
     let is_server = args.server.is_some();
     let sky = crate::weather_setup::SkyState { look: args.session_settings, ..Default::default() };
     // What loads, starts or reads the clock, made one after the other in a fixed order before
@@ -704,13 +709,13 @@ fn assemble_app(args: Args, settings: settings::Settings) -> App {
     let cabin_air = crate::condensation::CabinAir::new();
     let mut spray = puddles::Spray::new();
     spray.graphics = args.session_settings.graphics();
-    let radio = radio::Radio::load(&args_root_for_keys);
+    let radio = radio::Radio::load(&args.root);
     let started = Instant::now();
     let last = Instant::now();
     let input_script = parse_input_script();
-    let game_keys = omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).unwrap_or_default().with_game_defaults().with_vr_defaults().game;
-    let own_keys = crate::startup::own_keys(&args_root_for_keys);
-    let own_shift = crate::startup::own_bindings(&args_root_for_keys, omsi_content::input::KEY_SHIFT);
+    let game_keys = omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args.root)).unwrap_or_default().with_game_defaults().with_vr_defaults().game;
+    let own_keys = crate::startup::own_keys(&args.root);
+    let own_shift = crate::startup::own_bindings(&args.root, omsi_content::input::KEY_SHIFT);
     let fps_t = Instant::now();
     let update_watch = crate::update_watch::UpdateWatch::new();
     // (a server counts its players by their own games, not itself)
@@ -832,14 +837,15 @@ fn assemble_app(args: Args, settings: settings::Settings) -> App {
             key_capture: None,
             ctrl_add_action: false,
             menu_prev_pause: false,
-            info_bar,
+            // (as the last session left it, #1164)
+            info_bar: settings.info_bar,
             timetable: false,
             clean_screen: false,
             hud_resize: None,
             notices: Vec::new(),
             note_watch: Default::default(),
             loading: Default::default(),
-            menu_edit: None,
+            menu_edit: None, load_request: None,
             menu_edit_icao: false,
             menu_edit_number: false,
             menu_edit_ident: false,

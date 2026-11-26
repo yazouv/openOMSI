@@ -18,7 +18,7 @@ impl World {
         // (the mirrors' glass is the player's bus's: what the last one left is forgotten)
         self.mirror_aspect.lock().clear();
         self.mirror_glass.lock().clear();
-        let set = self.upload_vehicle(renderer, scene, vt, scheme, true);
+        let set = self.upload_vehicle(renderer, scene, vt, scheme, true, 0);
         self.player_textures.lock().clear();
         let mut render = self.instantiate_vehicle(renderer, scene, vt, &set, None, None, false);
         self.protect_player_textures(&set, &mut render);
@@ -30,7 +30,8 @@ impl World {
     /// A part coupled behind the player's vehicle (the rear section of an articulated bus).
     /// With `[scriptshare]` it has no scripts of its own: its matrix displays (`\S:n`,
     /// `[useScriptTexture] n`) are the leading vehicle's script textures, which is why the
-    /// O530G's rear section declares no `[scripttexture]` at all.
+    /// O530G's rear section declares no `[scripttexture]` at all. `mirror_base`: how many
+    /// mirror cameras the cars before it have (see `own_mirror`).
     pub fn add_vehicle_part(
         &self,
         renderer: &Renderer,
@@ -38,8 +39,9 @@ impl World {
         vt: &omsi_sim::VehicleType,
         scheme: Option<usize>,
         lead: &VehicleRender,
+        mirror_base: usize,
     ) -> VehicleRender {
-        let set = self.upload_vehicle(renderer, scene, vt, scheme, false);
+        let set = self.upload_vehicle(renderer, scene, vt, scheme, false, mirror_base);
         let shared = if vt.def.script_share || vt.model.script_textures.is_empty() {
             Some(lead.script_textures.as_slice())
         } else {
@@ -138,7 +140,7 @@ impl World {
             }
             return;
         }
-        let c = self.upload_vehicle(renderer, scene, vt, scheme, false);
+        let c = self.upload_vehicle(renderer, scene, vt, scheme, false, 0);
         self.vehicle_gpu.lock().insert(key, c);
     }
 
@@ -182,7 +184,7 @@ impl World {
         let set = match cached {
             Some(c) => c,
             None => {
-                let c = self.upload_vehicle(renderer, scene, vt, scheme, false);
+                let c = self.upload_vehicle(renderer, scene, vt, scheme, false, 0);
                 self.vehicle_gpu.lock().insert(key.clone(), c.clone());
                 c
             }
@@ -909,6 +911,7 @@ impl World {
         vt: &omsi_sim::VehicleType,
         scheme: Option<usize>,
         player: bool,
+        mirror_base: usize,
     ) -> VehicleSet {
         let dirs = vt.texture_dirs(&self.root);
         // (the scheme's pictures come named in full by the substitutions; its folder is
@@ -935,6 +938,7 @@ impl World {
         let mut up = VehicleUpload {
             vt,
             player,
+            mirror_base,
             subst: &subst,
             dirs: &dirs,
             dirs_ref: &dirs_ref,
@@ -1058,11 +1062,13 @@ impl World {
         let VehicleUpload {
             vt,
             player,
+            mirror_base,
             subst,
             dirs,
             dirs_ref,
             ..
         } = *up;
+        let own = |mi: usize| own_mirror(mi, mirror_base, vt.def.cameras_reflexion.len());
         let VehicleUpload {
             tex_ids,
             held,
@@ -1090,7 +1096,7 @@ impl World {
             ($name:expr, $dirs:expr) => {{
                 let nm: &str = &$name;
                 match mirror_index(nm) {
-                    Some(mi) => Some(self.mirror_texture(renderer, scene, mi)),
+                    Some(mi) => Some(self.mirror_texture(renderer, scene, own(mi))),
                     None => tex!(nm, $dirs, vehicle_texture),
                 }
             }};
@@ -1164,7 +1170,7 @@ impl World {
             if player {
                 self.note_mirror_aspect(mi, &vm.data, slot);
             }
-            Some(self.mirror_texture(renderer, scene, mi))
+            Some(self.mirror_texture(renderer, scene, own(mi)))
         } else if rain_layer && self.settings.snow() && !seasonal_texture(&tex_name, dirs_ref) {
             tex!("", &dirs_ref, snow_glass_texture)
         } else {
@@ -1419,6 +1425,7 @@ impl World {
                 textured,
             );
             let mut it_extra = material_extra(&ov_item, env_mask, bump, it_specular);
+            it_extra.pbr = mesh_pbr(it_extra.pbr, m);
             it_extra.ambient = Some(it_ambient);
             // (an item with no light map or glow of its own keeps its base's)
             it_extra.glow = if own_light_slot(ov_item) {
@@ -1725,9 +1732,21 @@ struct SlotAlpha {
     see_through: bool,
     transparent_layer_hint: bool,
     named_body: bool,
+    has_volume: bool,
     repair_body_depth: bool,
     /// Blended, and cut below Omsi.exe's alpha reference as well (see `MaterialExtra::alpha_cut`).
     tint_cut: bool,
+}
+
+pub(super) fn is_reflective_body(
+    named_body: bool,
+    named_pane: bool,
+    has_transmap: bool,
+    has_envmap: bool,
+    has_volume: bool,
+    clear_window: bool,
+) -> bool {
+    named_body && has_volume && !named_pane && !has_transmap && has_envmap && !clear_window
 }
 
 /// The alpha mode of a vehicle's material slot: what the model.cfg declares, mended for dirt films, shadow decals, panes and (on request) bodies.
@@ -1826,12 +1845,27 @@ fn slot_alpha(
             m.texture
         );
     }
-    let see_through = !named_pane
-        && !cover
-        && declared_alpha == AlphaMode::Blend
+    let named_body = ["body", "wagenkasten", "karos", "chassis", "kuzov"]
+        .iter()
+        .any(|part| mesh_name.contains(part));
+    let has_volume = material_has_vehicle_volume(&vm.data, slot);
+    let texture_see_through = declared_alpha == AlphaMode::Blend
         && coverage
             .as_ref()
             .is_some_and(|mask| slot_is_see_through(&vm.data, slot, mask));
+    let clear_window = declared_alpha == AlphaMode::Blend
+        && coverage
+            .as_ref()
+            .is_some_and(|mask| slot_is_clear_window(&vm.data, slot, mask));
+    let is_env_body = is_reflective_body(
+        named_body,
+        named_pane,
+        transmap.is_some(),
+        ov.iter().any(|o| o.envmap.is_some()),
+        has_volume,
+        clear_window,
+    );
+    let see_through = !named_pane && !cover && !is_env_body && texture_see_through;
     if see_through {
         log::debug!(
             "  {} slot {slot} '{}': see-through by its texture's alpha, writes no depth",
@@ -1857,14 +1891,11 @@ fn slot_alpha(
     // (the name alone still says what is drawn as glass: the same test finds
     // a gauge's needle film, a blind's net and the shadow under the bus)
     let transparent_layer_hint = named_pane;
-    let named_body = ["body", "wagenkasten", "karos", "chassis", "kuzov"]
-        .iter()
-        .any(|part| mesh_name.contains(part));
     let mesh_has_overlay = def.materials.iter().any(|o| o.no_z_write);
     // (a body-sized part in any case: a name or a bump map alone also took a
     // dashboard's display or a sticker on a mesh called "body" for bodywork)
-    let body_hint = (named_body || ov.iter().any(|o| o.bumpmap.is_some()) || !mesh_has_overlay)
-        && material_has_vehicle_volume(&vm.data, slot);
+    let body_hint =
+        (named_body || ov.iter().any(|o| o.bumpmap.is_some()) || !mesh_has_overlay) && has_volume;
     // a layer over another mesh of the same shape drawn before it (the WH UK
     // AI cars' baked shading over their paint, `[matl_alpha] 2`): blended as
     // the model says - made opaque, the dark bake covered the paint and the
@@ -1924,6 +1955,7 @@ fn slot_alpha(
         see_through,
         transparent_layer_hint,
         named_body,
+        has_volume,
         repair_body_depth,
         tint_cut,
     }
@@ -1952,9 +1984,7 @@ fn slot_extra(
     ),
     lm_white: &dyn Fn(&[&MaterialDef]) -> bool,
 ) -> ([f32; 4], [f32; 3], MaterialExtra) {
-    let SlotCx {
-        vm, def, slot, m, ..
-    } = *cx;
+    let SlotCx { vm, def, m, .. } = *cx;
     let SlotAlpha {
         alpha,
         declared_alpha,
@@ -1963,12 +1993,14 @@ fn slot_extra(
         see_through,
         transparent_layer_hint,
         named_body,
+        has_volume,
         repair_body_depth,
         tint_cut,
     } = *a;
     let (color, emissive, specular, ambient) =
         d3d_material(m, ov.iter().find_map(|o| o.allcolor), textured);
     let mut extra = material_extra(ov, env_mask, bump, specular);
+    extra.pbr = mesh_pbr(extra.pbr, m);
     extra.ambient = Some(ambient);
     // A vehicle's [matl_nightmap] is added whenever the mesh is drawn, by day
     // as well, as OMSI 2 does - with or without a [matl_change] around it.
@@ -2005,10 +2037,7 @@ fn slot_extra(
     extra.alpha_cut = tint_cut && alpha == AlphaMode::Blend;
     // (chrome: a small opaque part with a sphere map, not the body - see
     // `MaterialExtra::metal_ok`)
-    extra.metal_ok = envmap.is_some()
-        && alpha == AlphaMode::Opaque
-        && !named_body
-        && !material_has_vehicle_volume(&vm.data, slot);
+    extra.metal_ok = envmap.is_some() && alpha == AlphaMode::Opaque && !named_body && !has_volume;
     // A few stock vehicles leave noZwrite off on window/dirt materials even
     // though their alpha mode is Blend. They are transparent colour layers,
     // not solid shadow casters; letting them into the shadow map paints the
@@ -2051,6 +2080,7 @@ fn slot_extra(
 struct VehicleUpload<'a> {
     vt: &'a omsi_sim::VehicleType,
     player: bool,
+    mirror_base: usize,
     /// The paint scheme's `[CTCTexture]` substitutions.
     subst: &'a HashMap<String, String>,
     dirs: &'a [PathBuf],

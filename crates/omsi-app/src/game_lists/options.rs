@@ -17,10 +17,12 @@ pub(super) fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "traffic" => app.session.traffic.as_ref()?.target as f32,
         "pax" => s.pax_density,
         "passenger_transfer_percent" => s.passenger_transfer_percent,
+        "passenger_weight_kg" => s.passenger_weight_kg,
         "volume" => s.volume,
         "led_glow" => s.led_glow as f32,
         "night_brightness" => s.night_brightness,
         "fsr_sharpness" => s.fsr_sharpness,
+        "dlss_sharpness" => s.dlss_sharpness,
         "reflections" => s.reflections,
         "road_glare" => s.road_glare,
         "traffic_headlights" => s.traffic_headlights,
@@ -128,6 +130,13 @@ pub(super) fn option_set(
             Some(("pax_density", v.to_string()))
         }
         "passenger_transfer_percent" => set_connection_percent(app, v),
+        "passenger_weight_kg" => {
+            app.settings.passenger_weight_kg = v.clamp(20.0, 200.0);
+            Some((
+                "passenger_weight_kg",
+                app.settings.passenger_weight_kg.to_string(),
+            ))
+        }
         "volume" => {
             app.settings.volume = v;
             Some(("volume", v.to_string()))
@@ -146,6 +155,10 @@ pub(super) fn option_set(
         "fsr_sharpness" => {
             app.settings.fsr_sharpness = v.clamp(0.0, 1.0);
             Some(("fsr_sharpness", app.settings.fsr_sharpness.to_string()))
+        }
+        "dlss_sharpness" => {
+            app.settings.dlss_sharpness = v.clamp(0.0, 1.0);
+            Some(("dlss_sharpness", app.settings.dlss_sharpness.to_string()))
         }
         "reflections" => {
             app.settings.reflections = v.clamp(0.0, 1.0);
@@ -386,6 +399,17 @@ pub(super) fn option_set(
             remember_bus_seat(app);
             None
         }
+        _ => option_set_environment(app, verb, arg, v),
+    }
+}
+
+fn option_set_environment(
+    app: &mut App,
+    verb: &str,
+    _arg: &str,
+    v: f32,
+) -> Option<(&'static str, String)> {
+    match verb {
         // the clock set directly: the hour or the minute (the seconds stay)
         "hour" | "minute" => {
             if app
@@ -512,6 +536,7 @@ pub(super) fn toggle_now(app: &App, id: &str) -> Option<bool> {
     Some(match id {
         "passenger_connections" => s.passenger_connections,
         "passenger_hailing" => s.passenger_hailing,
+        "passenger_mass" => s.passenger_mass,
         "passenger_full_bus_reaction" => s.passenger_full_bus_reaction,
         "pax_short_rides_stand" => s.pax_short_rides_stand,
         "navigator" => {
@@ -586,12 +611,14 @@ pub(super) fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "nav_map_arrows" => s.nav_map_arrows,
         "exact_fare" => s.exact_fare,
         "pax_bad_driving" => s.pax_bad_driving,
+        "pax_stop_numbers_exact" => s.pax_stop_numbers_exact,
         "auto_announce" => s.auto_announce,
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
         "detail_textures" => s.detail_textures,
         "clouds" => s.clouds,
         "ray_tracing" => s.ray_tracing_on,
+        "rt_gi" => s.rt_gi,
         "cloud_shadows" => s.cloud_shadows,
         "light_glow" => s.light_glow,
         "volumetric_fog" => s.volumetric_fog,
@@ -599,6 +626,7 @@ pub(super) fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "rain_lights" => s.rain_lights,
         "detailed_trees" => s.detailed_trees,
         "road_snow" => s.road_snow,
+        "procedural_dirt" => s.procedural_dirt,
         "mirror_hud_every_frame" => s.mirror_hud_every_frame,
         "mirror_shadows" => s.mirror_shadows,
         "mirror_particles" => s.mirror_particles,
@@ -610,7 +638,9 @@ pub(super) fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "alt_view" => s.alt_view,
         "precision_zoom" => s.precision_zoom,
         "zoom_hold_latch" => s.zoom_hold_latch,
+        "others_detail" => s.others_detail,
         "flashlight_cursor" => s.flashlight_cursor,
+        "software_cursor" => s.software_cursor,
         "triple_screen" => s.triple.enabled,
         "triple_hud_center" => s.triple_hud_center,
         "triple_span" => s.triple_span,
@@ -648,6 +678,15 @@ pub(super) fn toggle_now(app: &App, id: &str) -> Option<bool> {
 /// Switch `id` on or off; the key and value to keep for the next game.
 pub(super) fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String)> {
     let bit = (on as u8).to_string();
+    toggle_set_gameplay(app, id, on, bit)
+}
+
+fn toggle_set_gameplay(
+    app: &mut App,
+    id: &str,
+    on: bool,
+    bit: String,
+) -> Option<(&'static str, String)> {
     match id {
         "passenger_connections" => {
             app.settings.passenger_connections = on;
@@ -663,6 +702,10 @@ pub(super) fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static 
                 };
             }
             Some(("passenger_connections", bit))
+        }
+        "passenger_mass" => {
+            app.settings.passenger_mass = on;
+            Some(("passenger_mass", bit))
         }
         "passenger_hailing" => {
             app.settings.passenger_hailing = on;
@@ -847,8 +890,17 @@ pub(super) fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static 
             app.sync_real_time();
             Some(("time_sync", bit))
         }
-        // the METAR sync: the weather goes over to the report of the nearest airport and
-        // cannot be changed while it is on (the cycle and a hand-made weather end with it)
+        _ => toggle_set_environment_and_graphics(app, id, on, bit),
+    }
+}
+
+fn toggle_set_environment_and_graphics(
+    app: &mut App,
+    id: &str,
+    on: bool,
+    bit: String,
+) -> Option<(&'static str, String)> {
+    match id {
         "metar_sync" => {
             app.settings.metar_sync = on;
             app.session.metar_rx = None;
@@ -959,6 +1011,12 @@ pub(super) fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static 
             app.settings.pax_bad_driving = on;
             Some(("pax_bad_driving", bit))
         }
+        "pax_stop_numbers_exact" => {
+            app.settings.pax_stop_numbers_exact = on;
+            // (the world's copy is read when the map index is built: a restart of the duty
+            // picks it up, the loaded map keeps the numbers it was read with)
+            Some(("pax_stop_numbers_exact", bit))
+        }
         "auto_announce" => {
             app.settings.auto_announce = on;
             Some(("auto_announce", bit))
@@ -991,6 +1049,10 @@ fn toggle_set_graphics_and_controls(
         "clouds" => {
             app.settings.clouds = on;
             Some(("clouds", bit))
+        }
+        "rt_gi" => {
+            app.settings.rt_gi = on;
+            Some(("rt_gi", bit))
         }
         "ray_tracing" => {
             app.settings.ray_tracing_on = on;
@@ -1025,6 +1087,10 @@ fn toggle_set_graphics_and_controls(
             Some(("detailed_trees", bit))
         }
         // (the next picture tells the road snow, see `picture_lighting`)
+        "procedural_dirt" => {
+            app.settings.procedural_dirt = on;
+            Some(("procedural_dirt", bit))
+        }
         "road_snow" => {
             app.settings.road_snow = on;
             Some(("road_snow", bit))
@@ -1084,6 +1150,14 @@ fn toggle_set_graphics_and_controls(
         "zoom_hold_latch" => {
             app.settings.zoom_hold_latch = on;
             Some(("zoom_hold_latch", bit))
+        }
+        "others_detail" => {
+            app.settings.others_detail = on;
+            Some(("others_detail", bit))
+        }
+        "software_cursor" => {
+            app.settings.software_cursor = on;
+            Some(("software_cursor", bit))
         }
         "flashlight_cursor" => {
             app.settings.flashlight_cursor = on;

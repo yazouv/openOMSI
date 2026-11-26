@@ -78,6 +78,8 @@ pub mod tick;
 pub mod walk;
 #[rustfmt::skip]
 pub mod report;
+pub mod load;
+pub use load::{PassengerWeight, SectionLoads};
 #[rustfmt::skip]
 pub mod avatar;
 #[rustfmt::skip]
@@ -102,6 +104,8 @@ pub mod ticket_hook;
 // What the renderer has to follow, the money on the desk and what the people need of the map.
 #[rustfmt::skip]
 pub mod bodies;
+#[rustfmt::skip]
+pub mod entry_doors;
 #[rustfmt::skip]
 pub mod pose_facts;
 #[rustfmt::skip]
@@ -130,10 +134,17 @@ mod desk_ticket_tests;
 mod destination_tests;
 #[cfg(test)]
 #[rustfmt::skip]
+mod entry_doors_tests;
+#[cfg(test)]
+mod button_door_tests;
+#[cfg(test)]
+#[rustfmt::skip]
 mod no_ticket_tests;
 #[cfg(test)]
 #[rustfmt::skip]
 mod late_tolerance_tests;
+#[cfg(test)]
+mod stuck_tests;
 #[cfg(test)]
 #[rustfmt::skip]
 mod free_drive_tests;

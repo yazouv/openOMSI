@@ -22,8 +22,9 @@ pub(crate) const TEMPORAL_MASK_FORMAT: mx::TextureFormat = mx::TextureFormat::R1
 /// bits of picture over the scene. 8 m is about 290 km/h at 10 fps.
 const MAX_FRAME_JUMP: f32 = 8.0;
 
-/// How much `upscale.wgsl` sharpens DLSS's result: DLSS no longer sharpens itself, FSR 3 does.
-const DLSS_SHARPEN: f32 = 0.25;
+/// How much `upscale.wgsl` sharpens DLSS's result unless the settings say otherwise
+/// (`RenderOptions::dlss_sharpness`): DLSS no longer sharpens itself, FSR 3 does.
+pub const DLSS_SHARPEN: f32 = 0.25;
 
 /// How much `upscale.wgsl` sharpens MetalFX's result, which MetalFX never sharpens itself. Chosen
 /// on St-Servan's pictures with `METALFX_MIP_BIAS`: 0.6 brought the gauges' numbers and the bark
@@ -36,6 +37,24 @@ const METALFX_SHARPEN: f32 = 0.4;
 /// Upscaling"): -1.58 at Quality. Without it the result was softer than the picture drawn at
 /// the window's size (bark, the gauges' numbers, grass).
 const METALFX_MIP_BIAS: f32 = -1.0;
+
+/// The motion vectors' uniform and the last frame's model places in the heap: the motion
+/// pipelines read them at the scene shader's `lights` and `grid` places, which they do not
+/// otherwise read (temporal/motion.wgsl; `frame_from_heap`).
+pub(crate) struct MotionHeap {
+    views: [mx::BufferView; 2],
+}
+
+impl MotionHeap {
+    /// The frame's places with the motion's in `lights` and `grid`.
+    pub(crate) fn heap(&self, frame: &FrameHeap) -> FrameHeap {
+        FrameHeap {
+            lights: self.views[0].index(),
+            grid: self.views[1].index(),
+            ..*frame
+        }
+    }
+}
 
 pub(crate) struct TemporalPipelines {
     pub(crate) prepass: [mx::RenderPipeline; 6],
@@ -51,13 +70,13 @@ pub(crate) struct TemporalTargets {
     output: (u32, u32),
     color: mx::Texture,
     pub(crate) color_view: mx::TextureView,
-    pub(crate) color_bg: mx::BindGroup,
+    pub(crate) color_bg: HeapGroup,
     motion: mx::Texture,
     pub(crate) motion_view: mx::TextureView,
     mask: mx::Texture,
     pub(crate) mask_view: mx::TextureView,
     output_tex: mx::Texture,
-    output_bg: mx::BindGroup,
+    output_bg: HeapGroup,
 }
 
 #[derive(Clone, Copy)]
@@ -80,7 +99,7 @@ pub(crate) struct TemporalState {
     keep: std::collections::VecDeque<Vec<mx::Texture>>,
     motion_buf: mx::Buffer,
     blit_buf: mx::Buffer,
-    pub(crate) prev_models: Option<(mx::Buffer, mx::BindGroup)>,
+    pub(crate) prev_models: Option<(mx::Buffer, MotionHeap)>,
     prev_epoch: u64,
     prev_entries: u32,
     prev: Option<TemporalPrev>,
@@ -379,23 +398,27 @@ impl Renderer {
             .create_view(&Default::default())
             .expect("mX: a texture view");
         let color_bg = self.picture_group(&color_view);
-        let output_bg = self.device.create_bind_group(&mx::BindGroupDescriptor {
-            label: Some("temporal output"),
-            entries: &[
-                mx::BindGroupEntry {
-                    binding: 0,
-                    resource: blit_buf.as_entire_binding(),
-                },
-                mx::BindGroupEntry {
-                    binding: 1,
-                    resource: mx::BindingResource::TextureView(&output_view),
-                },
-                mx::BindGroupEntry {
-                    binding: 2,
-                    resource: mx::BindingResource::Sampler(&self.tone.post_sampler),
-                },
-            ],
-        });
+        let output_bg = HeapGroup::of(
+            picture_layout(),
+            0,
+            &mx::BindGroupDescriptor {
+                label: Some("temporal output"),
+                entries: &[
+                    mx::BindGroupEntry {
+                        binding: 0,
+                        resource: blit_buf.as_entire_binding(),
+                    },
+                    mx::BindGroupEntry {
+                        binding: 1,
+                        resource: mx::BindingResource::TextureView(&output_view),
+                    },
+                    mx::BindGroupEntry {
+                        binding: 2,
+                        resource: mx::BindingResource::Sampler(&self.tone.post_sampler),
+                    },
+                ],
+            },
+        );
         let d = self.temporal.as_mut().expect("temporal state");
         if let Some(old) = d.targets.take() {
             d.keep
@@ -468,20 +491,11 @@ impl Renderer {
                         usage: mx::BufferUsages::STORAGE | mx::BufferUsages::COPY_DST,
                     })
                     .expect("mX: a buffer");
-                let bg = self.device.create_bind_group(&mx::BindGroupDescriptor {
-                    label: Some("temporal motion"),
-                    entries: &[
-                        mx::BindGroupEntry {
-                            binding: 0,
-                            resource: d.motion_buf.as_entire_binding(),
-                        },
-                        mx::BindGroupEntry {
-                            binding: 1,
-                            resource: buf.as_entire_binding(),
-                        },
-                    ],
-                });
-                d.prev_models = Some((buf, bg));
+                let views = [
+                    crate::pipelines::common::heap_view(&d.motion_buf),
+                    crate::pipelines::common::heap_view(&buf),
+                ];
+                d.prev_models = Some((buf, MotionHeap { views }));
                 d.prev_epoch = u64::MAX;
             }
         }
@@ -626,7 +640,9 @@ impl Renderer {
         // (`upscale.wgsl`'s third mode: the upscalers return the sRGB-encoded numbers they were
         // given, and writing them to the sRGB window unconverted would encode them twice)
         let sharpen = match d.runtime.method() {
-            mx_upscale::Method::Dlss | mx_upscale::Method::DlssRayReconstruction => DLSS_SHARPEN,
+            mx_upscale::Method::Dlss | mx_upscale::Method::DlssRayReconstruction => {
+                self.options.dlss_sharpness.clamp(0.0, 1.0)
+            }
             mx_upscale::Method::MetalFxTemporal | mx_upscale::Method::MetalFxSpatial => {
                 METALFX_SHARPEN
             }
@@ -688,7 +704,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.scale.upscale_pipeline);
-            pass.set_bind_group(0, bg);
+            bg.set(&mut pass);
             pass.draw(0..3, 0..1);
         }
         {
@@ -707,13 +723,13 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.scale.upscale_pipeline);
-            pass.set_bind_group(0, bg);
+            bg.set(&mut pass);
             pass.draw(0..3, 0..1);
             if overlays > 0 {
                 pass.set_pipeline(&self.overlay_pipeline_1x);
                 for k in 0..overlays {
                     if let Some((_, _, bg, _)) = scene.overlay_res.get(k) {
-                        pass.set_bind_group(0, bg);
+                        bg.set(&mut pass);
                         pass.draw(0..6, 0..1);
                     }
                 }

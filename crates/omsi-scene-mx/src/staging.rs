@@ -214,12 +214,43 @@ pub(super) fn larger_glass(old: Option<MirrorGlass>, new: MirrorGlass) -> Option
     Some(old.filter(|o| o.uv_area >= new.uv_area).unwrap_or(new))
 }
 
+#[cfg(test)]
+mod own_mirror_tests {
+    /// Every car's mirrors show its own cameras, a number past them stays the train's.
+    #[test]
+    fn a_cars_mirror_is_its_own_camera_in_the_trains_numbering() {
+        assert_eq!(super::own_mirror(0, 0, 2), 0, "the head car");
+        assert_eq!(
+            super::own_mirror(1, 2, 2),
+            3,
+            "the second car's second mirror"
+        );
+        assert_eq!(
+            super::own_mirror(5, 2, 2),
+            5,
+            "a screen showing another car's camera"
+        );
+        assert_eq!(
+            super::own_mirror(0, 2, 0),
+            0,
+            "a car with no camera of its own"
+        );
+    }
+}
+
 /// `reflexionN.bmp`: the texture drawn by reflection camera N of the vehicle.
 pub(super) fn mirror_index(name: &str) -> Option<usize> {
     let n = name.trim().to_ascii_lowercase();
     let rest = n.strip_prefix("reflexion")?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+/// The train's mirror picture a car's `reflexionN.bmp` shows. The train numbers its cameras
+/// on from car to car (`render_mirrors`); a number past the car's own is a screen showing
+/// another car's camera.
+pub(super) fn own_mirror(n: usize, base: usize, own: usize) -> usize {
+    if n < own { base + n } else { n }
 }
 
 /// A light map that is white all over (the LED panels' `vmatrix_leer_led_LM.png`, one white
@@ -500,100 +531,6 @@ pub struct StopBoards {
     pub departures_gen: u64,
 }
 
-/// The material slots of a lamp's mesh switched by its variables: `[alphascale] var`
-/// fades a slot (a lens shown by its alpha rather than by a `[visible]` mesh, as the
-/// Korean maps' signals do, #826) and `[matl_lightmap] tex var` lights it.
-#[derive(Clone, Default, Debug, PartialEq)]
-pub struct LampSlots {
-    pub count: usize,
-    pub alpha: Vec<(usize, String)>,
-    pub light: Vec<(usize, String)>,
-    pub uv: Vec<(usize, Option<String>, Option<String>)>,
-}
-
-impl LampSlots {
-    /// The `[alphascale]` and `[matl_lightmap]` variables of a mesh's material slots.
-    pub fn of_mesh(
-        o3d_mats: &[omsi_o3d::Material],
-        overrides: &[MaterialDef],
-        count: usize,
-    ) -> LampSlots {
-        let mut l = LampSlots {
-            count,
-            ..Default::default()
-        };
-        for o in overrides.iter().filter(|o| !o.item) {
-            let Some(slot) = omsi_sim::vehicle::override_slot(o3d_mats, o) else {
-                continue;
-            };
-            if let Some(v) = o.alphascale.as_ref().filter(|v| !v.trim().is_empty()) {
-                l.alpha.push((slot, v.trim().to_string()));
-            }
-            if let Some((_, v)) = &o.lightmap {
-                l.light.push((slot, v.trim().to_string()));
-            }
-            let trans = |v: &Option<String>| {
-                v.as_ref()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-            };
-            if o.texcoord_trans_x.is_some() || o.texcoord_trans_y.is_some() {
-                l.uv.push((slot, trans(&o.texcoord_trans_x), trans(&o.texcoord_trans_y)));
-            }
-        }
-        l
-    }
-
-    pub fn uv_values(&self, value: &dyn Fn(&str) -> Option<f32>) -> Vec<[f32; 2]> {
-        let mut uv = vec![
-            [0.0; 2];
-            if self.uv.is_empty() {
-                0
-            } else {
-                self.count.max(1)
-            }
-        ];
-        for (slot, x, y) in &self.uv {
-            if let Some(u) = uv.get_mut(*slot) {
-                if let Some(x) = x {
-                    u[0] = value(x).unwrap_or(0.0);
-                }
-                if let Some(y) = y {
-                    u[1] = value(y).unwrap_or(0.0);
-                }
-            }
-        }
-        uv
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.alpha.is_empty() && self.light.is_empty()
-    }
-
-    /// The slots' alpha and light-map switch from the lamp's variables (`value`: `None`
-    /// for a variable the lamp does not have). Alpha: the variable's value, a slot without
-    /// one opaque as authored. Light map: on from 0.5; a variable the lamp does not have
-    /// (or none at all) leaves it on, as Omsi.exe's stage does with an unregistered one.
-    pub fn values(&self, value: &dyn Fn(&str) -> Option<f32>) -> (Vec<f32>, Vec<f32>) {
-        let mut alpha = vec![1.0; self.count.max(1)];
-        let mut light = vec![1.0; self.count.max(1)];
-        for (slot, v) in &self.alpha {
-            if let (Some(a), Some(x)) = (alpha.get_mut(*slot), value(v)) {
-                *a = x.clamp(0.0, 1.0);
-            }
-        }
-        for (slot, v) in &self.light {
-            if let (Some(l), Some(x)) = (
-                light.get_mut(*slot),
-                (!v.is_empty()).then(|| value(v)).flatten(),
-            ) {
-                *l = if x >= 0.5 { 1.0 } else { 0.0 };
-            }
-        }
-        (alpha, light)
-    }
-}
-
 /// `LightObject::parent` of a signal that names no crossing: no crossing has this id.
 pub const NO_CROSSING: i64 = i64::MIN;
 
@@ -811,6 +748,9 @@ pub(super) struct StagedSpline {
 /// terrain does not - a caster in one plane with what it falls on paints dark patches into
 /// it (the sun shadow's bias is 6 cm). Splines are surfaces and cast nothing otherwise.
 pub(super) const SPLINE_SHADOW_CLEARANCE: f32 = 0.75;
+/// A spline whose profiles rise this far (m) is a structure (a tunnel, a wall) and casts its
+/// shadow wherever it lies.
+pub(super) const SPLINE_STRUCTURE_HEIGHT: f32 = 2.0;
 /// A spline whose profiles all hang this far (m) over its line - wires, catenaries, a
 /// canopy - is no ground surface: it neither cuts the terrain nor carries anything.
 pub(super) const SPLINE_OVERHEAD: f32 = 2.0;

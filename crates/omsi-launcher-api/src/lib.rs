@@ -7,6 +7,7 @@
 
 mod addons;
 pub mod i18n;
+mod plugin_catalog;
 mod timetable;
 mod updates;
 mod versions;
@@ -269,13 +270,13 @@ fn rename_situation(map: String, file: String, name: String) -> Answer {
 /// A season and its phase chosen: the date the game will have (none: by date), and the word
 /// the game's `--season` takes.
 fn season_date(season: String, phase: String, date: String, map: String, keep: bool) -> Answer {
-    use omsi_weather::season_phase::{SeasonChoice, map_latitude, phase_date};
+    use omsi_weather::season_phase::{SeasonChoice, map_lat_deg, phase_date};
     let Some(choice) = SeasonChoice::parse(&format!("{season}-{phase}")) else {
         return Ok(json!({ "date": null, "word": null }));
     };
     let num = |r: std::ops::Range<usize>| date.get(r).and_then(|x| x.parse::<u32>().ok());
     let root = core::root_dir().unwrap_or_default();
-    let lat = map_latitude(&root, &map);
+    let lat = map_lat_deg(&root, &map);
     let year = num(0..4).unwrap_or(1989) as i32;
     let (y, m, d) = match (num(5..7), num(8..10)) {
         (Some(m), Some(d)) if keep => phase_date(choice, (year, m, d), lat),
@@ -1197,6 +1198,21 @@ fn answer(cmd: &str, args: &Value, p: &dyn Platform) -> Answer {
         "radio_stations" => radio_stations(),
         "radio_stations_save" => radio_stations_save(arg::<Vec<Value>>(args, "list")?),
         "mods_status" => mods_status(),
+        "plugins_status" => Ok(core::plugins::status()),
+        "plugin_set_enabled" => {
+            core::plugins::set_enabled(&arg::<String>(args, "name")?, arg::<bool>(args, "on")?)
+                .map(|_| json!(true))
+                .map_err(err)
+        }
+        "plugin_catalog" => plugin_catalog::list(),
+        "plugin_install" => plugin_catalog::install(&arg::<String>(args, "id")?),
+        "plugin_remove" => plugin_catalog::remove(&arg::<String>(args, "id")?),
+        "plugin_settings_save" => core::plugins::save_settings(
+            &arg::<String>(args, "name")?,
+            &arg::<Value>(args, "values")?,
+        )
+        .map(|_| json!(true))
+        .map_err(err),
         "add_hofs" => add_hofs(arg::<Vec<String>>(args, "files")?),
         "share_map_hofs" => share_map_hofs(arg::<String>(args, "map")?),
         "mod_set_enabled" => mod_set_enabled(arg::<String>(args, "id")?, arg::<bool>(args, "on")?),

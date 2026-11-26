@@ -1,7 +1,7 @@
 fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bool, eye: vec3<f32>) -> vec4<f32> {
     // (the pane's water, read once for the uses below)
     let film_water = window_wetness(in);
-    if (material.emissive.w > 1.5) {
+    if (!LEAN && material.emissive.w > 1.5) {
         // a pane's film of water: drops laid out on the glass, each a lens that mirrors the
         // sky probe and shows the street upside down through itself, and the haze of the wet
         // glass between them (07_glass.wgsl `glass_film`)
@@ -12,6 +12,10 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     var duv = tex_address(in.uv);
     if (terrain) {
         duv = in.uv * material.extra.z;
+    }
+    // a height map (in the PBR set's ORM alpha, `foo_height`): parallax occlusion mapping
+    if (!LEAN && material.pbr.x > 3.5 && !terrain) {
+        duv = parallax_uv(duv, in.world, safe_normal(in.normal), normalize(eye - in.world));
     }
     // (without the [texcoordtransX/Y] offset: the transmap, night map and light map stay
     // in place, see fs_main)
@@ -40,16 +44,17 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     let pic_lod = led_lod(duv, vec2<f32>(textureDimensions(t_diffuse)));
     let led_pic = material.emissive.w < -1.5 && enh.led.y < pic_lod;
     // The painted ground's albedo comes from the picture `fs_ground` laid (the base's and its
-    // layers', the frame's `camera.lod.y`): the terrain's base is lit once for all of them.
+    // layers', the frame's `camera.lod.y`; read from the heap at `FrameHeap::ground`): the
+    // terrain's base is lit once for all of them.
     // (A condition of the draw alone, so the texture reads below stay in uniform control flow;
     // `Renderer::plan_ground` has seen to it that every draw this holds for is in that picture.)
     let from_ground = camera.lod.y > 0.5 && terrain && !TERRAIN_PAINT && !capture && material.params.x < 0.5 && material.params.z < 0.5;
     var tex = vec4<f32>(1.0);
     if (from_ground) {
-        tex = vec4<f32>(textureLoad(t_ao, vec2<i32>(in.clip.xy), 0).rgb, 1.0);
+        tex = vec4<f32>(textureLoad(mx_tex2d[mx_mat.ground], vec2<i32>(in.clip.xy), 0).rgb, 1.0);
     } else {
         tex = diffuse_border(textureSampleBias(t_diffuse, s_diffuse, duv, camera.lod.x), duv);
-        if (is_snow_pane()) {
+        if (!LEAN && is_snow_pane()) {
             tex = glass_snow(in, film_water);
         }
         if (led_pic) {
@@ -132,11 +137,32 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // the blob, is darkened with it as in the original).
         return vec4<f32>(aer.rgb * pre, alpha * aer.a);
     }
+    // the rain's drops on a vehicle out in the weather - its paint and its outside mirrors
+    // (`vehicle_drops`), worked out once here for both, within some 25 m (30 for a mirror)
+    let drop_dw = mat2x3<f32>(dpdx(in.world), dpdy(in.world));
+    let drop_dl = mat2x3<f32>(dpdx(in.local), dpdy(in.local));
+    let drop_duv = mat2x2<f32>(dpdx(duv), dpdy(duv));
+    let is_mirror = material.params.y > 0.5 && material.params.y < 0.95;
+    var drops = VehicleDrops(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, 0.0);
+    // (the full pipelines only: a vehicle's part takes them on a wet frame, `main_key`)
+    if (!LEAN && !ALPHA_TEST && camera.shadow.w > 0.0 && dist < 30.0 && (is_mirror || in.params2.w < -500.0)) {
+        let dn = safe_normal(in.normal);
+        let wet_v = clamp(camera.shadow.w * 1.3, 0.0, 1.0) * weather_outside_n(in.world, dn, false, in.params2.w)
+            * (1.0 - clamp(enh.weather.y, 0.0, 1.0));
+        if (wet_v > 0.01) {
+            drops = vehicle_drops(in.world, in.local, dn, wet_v, camera.post.y, drop_dw, drop_dl);
+        }
+    }
     if (material.params.y > 0.5) {
         // unlit (mirror glass, script and text textures): shown at their own brightness,
         // under the tone curve's knee (`display_level`), and `exposure.y` undoes the
         // metering (see ExposureLog in lib.rs)
-        let t = tex.rgb * material.color.rgb;
+        var t = tex.rgb * material.color.rgb;
+        // a mirror out in the rain: the drops on its glass bend its picture (`mirror_bend`)
+        if (is_mirror && drops.cover > 0.0) {
+            let bent = textureSampleGrad(t_diffuse, s_diffuse, mirror_bend(duv, drop_duv, drop_dw, drops), drop_duv[0], drop_duv[1]).rgb * material.color.rgb;
+            t = mix(t, bent * (1.0 - 0.45 * drops.rim), drops.cover);
+        }
         // A mirror (params.y 0.9) is no display: its picture is the street drawn a moment
         // ago, dark at night. Brightened like a display by the metering (up to 1.6 in the
         // dark) it showed a street far brighter than the one through the windscreen.
@@ -147,6 +173,14 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         return vec4<f32>(c * aer.a + aer.rgb * pre, alpha);
     }
     let outside = weather_outside_n(in.world, safe_normal(in.normal), terrain, in.params2.w);
+    // where the rain reaches: out in the weather, and for what faces up not under a roof
+    // (`roof_dry`: the road under a bridge or in a depot stays dry)
+    var rain_reach = outside;
+    // (not in the alpha-tested pipelines - leaves and fences - which with it were more than
+    // Apple's M4 shader compiler service took)
+    if (WET && !ALPHA_TEST && camera.shadow.w > 0.0 && outside > 0.0 && in.normal.z > 0.3) {
+        rain_reach = outside * (1.0 - roof_dry(in.world) * smoothstep(0.3, 0.7, safe_normal(in.normal).z));
+    }
     // the normal as the content gives it: never turned towards the viewer (Direct3D does
     // not either, and OMSI's foliage points every leaf's normal up so the whole crown is lit
     // evenly - turned round, the crown went dark above the horizon line)
@@ -154,7 +188,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // the map's water (`MaterialExtra::water`): small waves running over it ripple its
     // normal - fading with the distance, where they would only flicker - so that what it
     // mirrors breaks up as on a lake instead of standing in it as in a pane of glass (#841)
-    let is_water = material.ambient.w > 1.5;
+    let is_water = !LEAN && material.ambient.w > 1.5;
     if (is_water) {
         n = normalize(n + vec3<f32>(water_ripple(world_pattern_xy(in.world), camera.post.y) * clamp(1.0 - dist / 250.0, 0.2, 1.0), 0.0));
     }
@@ -175,7 +209,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // depth, its letters a `\S:n` transparency map: the EMT Citaro's Krueger matrix
     // (Mallorca) was taken for glass, which gives no light of its own, and its letters stayed
     // grey at night while its light map lit them in Vanilla+ (#2927).
-    let glass = !terrain && mode > 1.5 && (material.bump.z > 0.5 || material.emissive.w > 0.5) &&
+    let glass = (!LEAN || LEAN_GLASS) && !terrain && mode > 1.5 && (material.bump.z > 0.5 || material.emissive.w > 0.5) &&
         (has_env || material.params.z > 0.5 || material.emissive.w > 0.5) && material.flags.x < 0.5;
     // An envmap on opaque vehicle paint is legacy material data, not a request to make
     // the whole body behave like glass. Keep the diffuse/sun response, but use the
@@ -214,7 +248,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             face_w = smoothstep(0.5, 0.9, dot(n, face));
         }
     }
-    if (reflective_env && material.bump.y > 0.5) {
+    if (!LEAN && reflective_env && material.bump.y > 0.5) {
         // [matl_bumpmap]: the height map's slope bends the normal (tangent frame from the
         // screen-space derivatives of position and texture coordinate)
         let slope = bump_offset(duv);
@@ -236,6 +270,12 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // A slot without a texture (ambient.w -1) takes its diffuse colour for both: Omsi.exe's
     // white ambient of every o3d slot under a strong sky turned a coloured model white (#1737).
     var ambient_albedo = select(tex.rgb * material.ambient.rgb, albedo, material.ambient.w < -0.5 || from_ground);
+    // [matl_basecolor] (openOMSI, `PbrFactors`): the texture's colour times the factor, as
+    // glTF's base colour factor - the whole colour of a slot without a texture
+    if (pbr_set(1u) && !from_ground) {
+        albedo = albedo * material.base_color.rgb;
+        ambient_albedo = ambient_albedo * material.base_color.rgb;
+    }
     var detail_factor = 1.0;
     if (camera.flags.x > 0.5 && (terrain || in.params2.w > 0.5)) {
         let k = clamp(1.0 - (dist - 25.0) / 120.0, 0.0, 1.0);
@@ -277,7 +317,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // 12 % at the normal, and three quarters of that, left the windows showing the
         // saloon where the vanilla picture shows the street.
         let share = clamp(alpha * min(material.params2.y, 1.0), 0.0, 1.0) * camera.cam_pos.w;
-        f0 = vec3<f32>(select(clamp((share - 1.0 / 21.0) * 21.0 / 20.0, 0.04, 0.9), 0.04, probe_only));
+        f0 = vec3<f32>(clamp((share - 1.0 / 21.0) * 21.0 / 20.0, 0.04, select(0.9, 0.12, probe_only)));
     } else if (reflective_env) {
         // Paint reflects its few per cent through a smooth clear coat; much more than a few
         // per cent is polished metal - but only where the model says so with a mask of its
@@ -341,15 +381,19 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // `foo_orm`: see omsi_texture::pbr): the normal map bends the normal, the packed map
     // gives the occlusion, roughness and metalness in place of the guesses above
     var pbr_ao = 1.0;
-    if (material.pbr.x > 0.5 && !terrain) {
+    if (!LEAN && pbr_normal_flag() > 0.5 && !terrain) {
         var tn = textureSampleBias(t_pbr_normal, s_diffuse, duv, camera.lod.x).xyz * 2.0 - vec3<f32>(1.0);
         // (an OpenGL-style map, green up: `_gl` in its name)
-        if (material.pbr.x > 1.5) {
+        if (pbr_normal_flag() > 1.5) {
             tn.y = -tn.y;
+        }
+        // ([matl_normal_strength]: the map's slopes scaled, 0 flat)
+        if (pbr_set(8u)) {
+            tn = vec3<f32>(tn.xy * material.pbr_factor.z, tn.z);
         }
         n = perturb_normal(n, in.world, duv, tn);
     }
-    if (material.pbr.y + material.pbr.z + material.pbr.w > 0.5 && !terrain) {
+    if (!LEAN && material.pbr.y + material.pbr.z + material.pbr.w > 0.5 && !terrain) {
         let orm = textureSampleBias(t_pbr_orm, s_diffuse, duv, camera.lod.x).rgb;
         if (material.pbr.y > 0.5) {
             pbr_ao = orm.r;
@@ -362,14 +406,40 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             f0 = mix(vec3<f32>(0.04), albedo, metal);
         }
     }
+    // The PBR factors (openOMSI `[matl_metallic]`, `[matl_roughness]`,
+    // `[matl_occlusion_strength]`; `PbrFactors`), as glTF takes them: with a map the map
+    // times the factor, without one the factor itself, in place of the guesses above.
+    if (!LEAN && material.base_color.w > 1.5 && !terrain) {
+        if (pbr_set(16u)) {
+            pbr_ao = mix(1.0, pbr_ao, material.pbr_factor.w);
+        }
+        if (pbr_set(4u)) {
+            rough = clamp(select(material.pbr_factor.y, rough * material.pbr_factor.y, material.pbr.z > 0.5), 0.03, 1.0);
+        }
+        if (pbr_set(2u)) {
+            metal = clamp(select(material.pbr_factor.x, metal * material.pbr_factor.x, material.pbr.w > 0.5), 0.0, 1.0);
+            f0 = mix(vec3<f32>(0.04), albedo, metal);
+        }
+    }
     // rain: roads with [moisture] turn dark and smooth, everything outside a little glossier
     // (not under snow: a snowy road took the rain's gloss and the snow on it shone like
     // plastic in every headlight)
     let dry_snow = 1.0 - clamp(enh.weather.y, 0.0, 1.0);
-    let wet_road = camera.shadow.w * material.params2.z * outside * dry_snow;
-    let wet_any = camera.shadow.w * outside * select(0.35, 0.0, glass) * dry_snow;
+    let wet_soaked = camera.shadow.w * material.params2.z * rain_reach * dry_snow;
+    // (the lanes' wheel tracks: water stands in them, and they dry first - `rut_water`)
+    var ruts = vec2<f32>(0.0);
+    // (not in the snow's pipelines: under snow the ruts are the snow's own, with their slush,
+    // and both together were more than Apple's M4 shader compiler service took)
+    if (WET && !SNOW && wet_soaked > 0.0 && !terrain) {
+        // (by the road's wetness as the weather has it, as the spray takes it - `rut_water` in
+        // omsi-scene's puddles.rs - not scaled by the surface's [moisture]: a road that takes
+        // in less water still has the water standing in its ruts in a downpour)
+        ruts = rut_water(in.world, lane_ruts(in.world.xy), camera.shadow.w * rain_reach * dry_snow);
+    }
+    let wet_road = wet_soaked * (1.0 - 0.6 * ruts.y);
+    let wet_any = camera.shadow.w * rain_reach * select(0.35, 0.0, glass) * dry_snow;
     var puddle = 0.0;
-    if (wet_road > 0.0) {
+    if (WET && wet_road > 0.0) {
         albedo = albedo * mix(1.0, 0.5, wet_road);
         ambient_albedo = ambient_albedo * mix(1.0, 0.5, wet_road);
         rough = mix(rough, 0.12, wet_road);
@@ -385,7 +455,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // half of the wheel splashes in `puddles.rs`.
         let pattern_xy = world_pattern_xy(in.world);
         // (the pools: see `road_puddle_coverage`, shared with the classic picture)
-        puddle = road_puddle_coverage(in.world, n, wet_road);
+        puddle = max(road_puddle_coverage(in.world, n, wet_soaked), ruts.x * smoothstep(0.75, 0.95, n.z));
         if (puddle > 0.001) {
             // A drop is a few millimetres across and its ring dies away within a hand's
             // breadth, so the shared ripple grid is 12.5 cm wide and a ring grows
@@ -406,7 +476,14 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             f0 = mix(f0, vec3<f32>(enh.debug.y), puddle);
             n = normalize(mix(n, geo_n, puddle) + vec3<f32>(ripple.xy, 0.0));
         }
-    } else if (wet_any > 0.0) {
+    } else if (WET && wet_any > 0.0) {
+        // a vehicle's body: the drops its paint beads the rain into and the ones that run
+        // down it (`vehicle_drops`, worked out above), faded out from 15 to 25 m
+        if (drops.cover > 0.0 && !is_mirror && !glass && !thin) {
+            let k = drops.cover * (1.0 - smoothstep(15.0, 25.0, dist));
+            n = normalize(mix(n, drops.n, k));
+            rough = mix(rough, 0.02, k);
+        }
         // (a body's paint wears a film of water as smooth as glass: the street and the sky
         // mirror in a wet bus as sharply as in its windows)
         // (Lagarde's wet surfaces: the water stands on what faces up and runs off a wall,
@@ -424,7 +501,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // film's top (total internal reflection), and meets the surface once more, which
         // absorbs a share of it each time (Lekner and Dorf, "Why some things are darker
         // when wet", Applied Optics 1988). Painted metal, glass and leaves shed the water.
-        let soak = camera.shadow.w * outside * dry_snow * select(0.75, 1.0, terrain) * mix(0.3, 1.0, porous)
+        let soak = camera.shadow.w * rain_reach * dry_snow * select(0.75, 1.0, terrain) * mix(0.3, 1.0, porous)
             * mix(0.45, 1.0, clamp(n.z, 0.0, 1.0)) * select(1.0, 0.0, reflective_env || glass || is_water || thin || metal > 0.5);
         albedo = mix(albedo, wet_albedo(albedo), soak);
         ambient_albedo = mix(ambient_albedo, wet_albedo(ambient_albedo), soak);
@@ -437,25 +514,27 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // a carriageway under snow that builds up: its own cover, ruts and tracks (road_snow.wgsl)
     let carriageway = !terrain && material.params2.z > 0.0 && road_snow_dynamic();
     var rs = vec3<f32>(0.0);
-    if (carriageway && snow_ok > 0.0) {
+    // (not in a plain `LEAN` pipeline: Apple's shader compiler crashed on it there, and a
+    // carriageway is drawn with the full pipelines in a snowy frame, `Lean::PlainRoad`)
+    if (SNOW && (!LEAN || LEAN_GLASS) && carriageway && snow_ok > 0.0) {
         rs = road_snow(in.world);
     }
     // a vehicle's part: the snow its own roof has gathered, where that is kept (another
     // player's bus keeps the weather's)
     let vehicle = vehicle_snow_kept(in.params2.w);
     var on_vehicle = 0.0;
-    if (vehicle && snow_ok > 0.0) {
+    if (SNOW && vehicle && snow_ok > 0.0) {
         on_vehicle = vehicle_snow(in.params2.w, in.local);
     }
     let snow = select(select(enh.weather.y, rs.x, carriageway), on_vehicle, vehicle) * snow_ok;
-    if (rs.y > 0.0) {
+    if (SNOW && rs.y > 0.0) {
         // the slush in the ruts and the tracks: wet and grey, darker than the snow, glossy
         let slush = rs.y * snow_ok;
         albedo = mix(albedo, albedo * 0.55 + vec3<f32>(0.08), slush);
         ambient_albedo = mix(ambient_albedo, ambient_albedo * 0.55 + vec3<f32>(0.08), slush);
         rough = mix(rough, 0.35, slush);
     }
-    if (snow > 0.0) {
+    if (SNOW && snow > 0.0) {
         let up = clamp(n.z, 0.0, 1.0);
         let ground = select(0.0, 1.0, terrain || material.params2.z > 0.0);
         // (a road kept clear - "snow on road" off - stays asphalt: whitened, it turned the
@@ -471,6 +550,22 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         f0 = mix(f0, vec3<f32>(0.02), cover);
         metal = metal * (1.0 - cover);
     }
+    // the road dirt on a vehicle's outside (#1386, `road_dirt`): over the paint and the glass,
+    // matt where dry, glossy while wet; a pane dirtied loses its view through it
+    // (not on a slot marked `[matl_nodirt]`: material.params2.w's bit 32)
+    if (enh.dirt_n.x > 0.5 && in.params2.w < -500.0 && !terrain && (u32(material.params2.w + 0.5) & 32u) == 0u) {
+        let dirt = road_dirt(in.world, n, glass);
+        if (dirt.a > 0.0) {
+            albedo = mix(albedo, dirt.rgb, dirt.a);
+            ambient_albedo = mix(ambient_albedo, dirt.rgb, dirt.a);
+            rough = mix(rough, mix(0.9, 0.45, dirt_wet), dirt.a);
+            f0 = mix(f0, vec3<f32>(0.03), dirt.a);
+            metal = metal * (1.0 - dirt.a);
+            if (glass) {
+                alpha = mix(alpha, 1.0, dirt.a * 0.85);
+            }
+        }
+    }
     // specular antialiasing: where the normal turns quickly across a pixel (a low-poly
     // bonnet close up, a curved body far away) the surface cannot reflect sharper than that
     // spread, or the interpolated normals show as bands in a mirror-like finish
@@ -484,8 +579,12 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     }
     let env_share = select(1.0, camera.cam_pos.w, reflective_env && !glass);
     var sf: Surface;
-    sf.albedo = albedo * (1.0 - metal);
-    ambient_albedo = ambient_albedo * (1.0 - metal);
+    // Translucent panes transmit light through their alpha blend. Lighting their full tint
+    // as diffuse paint adds a grey veil, especially where a bus models both faces of the
+    // glass. Fade the diffuse response with opacity so solid markings retain their colour.
+    let diffuse_share = (1.0 - metal) * select(1.0, alpha, glass);
+    sf.albedo = albedo * diffuse_share;
+    ambient_albedo = ambient_albedo * diffuse_share;
     sf.f0 = f0;
     sf.rough = rough;
     let nv = clamp(mix(face_v, dot(n, v), face_w), 1e-4, 1.0);
@@ -546,8 +645,13 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             // light having passed the leaf's colour twice.
             let through = pow(clamp(dot(-v, s), 0.0, 1.0), 3.0);
             let leaf = sf.albedo / PI;
-            direct = e_sun * (leaf * (0.42 + 0.3 * max(nl, 0.0) + 0.08 * max(-nl, 0.0))
-                + leaf * min(sf.albedo * 2.2, vec3<f32>(1.0)) * through * 0.45);
+            let crown_light = leaf * (0.42 + 0.3 * max(nl, 0.0) + 0.08 * max(-nl, 0.0))
+                + leaf * min(sf.albedo * 2.2, vec3<f32>(1.0)) * through * 0.45;
+            // A cut-out whose normal lies level is no crown: a fence, a bridge's railing,
+            // mapped once per side with the normals turned round. Its normal says which way
+            // it faces and the sun lights that side alone, as Omsi.exe's N.L does - lit from
+            // every side, the side turned away from the sun glowed in it (#2687).
+            direct = e_sun * mix(leaf * max(nl, 0.0), crown_light, crown_share(n));
         } else if (nl > 0.0) {
             // the sun is a disc, not a point: no highlight sharper than it
             let a = max(rough * rough, 0.012);
@@ -580,7 +684,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             }
             let leaf = sf.albedo / PI;
             if (thin) {
-                direct = direct + em * ms * leaf * (0.42 + 0.3 * max(nlm, 0.0));
+                direct = direct + em * ms * leaf * mix(max(nlm, 0.0), 0.42 + 0.3 * max(nlm, 0.0), crown_share(n));
             } else {
                 direct = direct + em * ms * nlm * leaf;
             }
@@ -625,6 +729,21 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     }
     var e_amb = mix(sky_e, cab_e * CAB_AMBIENT, 0.6 * in_cab) * ao_bounce(ao, ambient_albedo)
         + flash_irradiance(n) * ao * (1.0 - 0.7 * in_cab);
+    // Experimental (`rt_gi`, camera.clouds.w 3): the traced global illumination in place of
+    // the guesses above. The sky lights the point as far as its rays saw it (within 40 m, not
+    // only the occlusion's two: under a bridge, in a narrow street), and the light the
+    // surfaces round it send back - the sun, the sky, the lamps and the unlit glow on them,
+    // one bounce - takes the place of the multi-bounce fit's brightening. Inside the cab the
+    // even cabin light keeps a smaller share: the rays bring in what the windows let in.
+    var gi = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    if (screen_ao && camera.clouds.w > 2.5 && !(glass || mode > 1.5)) {
+        gi = gi_at(in.clip.xy, in.world);
+        if (gi.a >= 0.0) {
+            let sky_occ = min(ao, gi.a * pbr_ao);
+            e_amb = mix(sky_e * sky_occ, cab_e * CAB_AMBIENT * ao, GI_CAB_SHARE * in_cab)
+                + gi.rgb * pbr_ao + flash_irradiance(n) * ao * (1.0 - 0.7 * in_cab);
+        }
+    }
 //VK     if (screen_ao && in_cab < 1.0) {
 //VK         e_amb = e_amb + bounce_at(in.clip.xy, in.world) * mix(1.0, ao, 0.5) * (1.0 - in_cab);
 //VK     }
@@ -642,7 +761,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // A wet road, a wet pavement is no mirror: a soft, dim sheen of what stands round it, a
     // puddle a blurred picture of it (panes, envmapped paint and still water keep their own
     // smoothness). Its reflection is taken this rough, at this share.
-    let wet_only = !(reflective_env || glass || is_water || ((material.pbr.z > 0.5 || material.pbr.w > 0.5) && !terrain));
+    let wet_only = !(reflective_env || glass || is_water || (pbr_reflective() && !terrain));
     let refl_rough = select(rough, max(rough, mix(0.2, 0.16, puddle)), wet_only);
     let wet_share = select(1.0, mix(0.6, 0.7, puddle), wet_only);
     let lod = refl_rough * (enh.lights.x - 1.0);
@@ -688,14 +807,14 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         if (!glass) {
             env_uv = in.env_uv;
         }
-        if (material.bump.y > 0.5) {
+        if (!LEAN && material.bump.y > 0.5) {
             env_uv = env_uv + bump_offset(duv);
         }
         // (with the mip level its footprint needs on top of the blur: a fixed level showed
         // the photo's trees as contour lines across a car's curved bonnet close up, and
         // paint takes it as blurred as the vanilla path does)
-        let photo = textureSampleBias(t_env, s_diffuse, env_uv, max(rough * 16.0, select(2.0, 0.0, glass))).rgb;
-        let photo_avg = textureSampleLevel(t_env, s_diffuse, vec2<f32>(0.5, 0.5), 12.0).rgb;
+        let photo = textureSampleBias(t_env, s_ao, env_uv, max(rough * 16.0, select(2.0, 0.0, glass))).rgb;
+        let photo_avg = textureSampleLevel(t_env, s_ao, vec2<f32>(0.5, 0.5), 12.0).rgb;
         let lum_avg = max(dot(photo_avg, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.02);
         // (a tint, not a picture: an unbounded ratio drew the photo's trees as bands)
         // (the photo's own contrast, as the vanilla picture shows it, held only off black
@@ -720,7 +839,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // what the SSAO darkens, it also keeps reflections out of
     let spec_occ = clamp(pow(nv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
     // (a PBR set's roughness or metalness map says how it reflects: the probe, as for an envmap)
-    let pbr_reflects = (material.pbr.z > 0.5 || material.pbr.w > 0.5) && !terrain;
+    let pbr_reflects = pbr_reflective() && !terrain;
     // (a wet road mirrors the sky probe as well; and what reflects nothing keeps the light
     // the Fresnel term took off its ambient above - at a grazing angle that term is near 1,
     // and the far road and ground went dark with no reflection in its place, #374)
@@ -731,6 +850,13 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // own share.
     let reflects = !thin;
     var refl_f = spec_e.rgb * spec_occ * horizon * select(1.0, mix(1.0, wet_share, wet_road), wet_only);
+    // (the traced global illumination: a rough surface's reflection - the probe's blurred sky
+    // - only as much as its rays saw the sky; under a roof, a bridge or in the saloon it
+    // mirrored the open sky there, a grey sheen over everything; a smooth one's own traced
+    // reflection knows what it mirrors)
+    if (gi.a >= 0.0) {
+        refl_f = refl_f * mix(1.0, clamp(gi.a, 0.0, 1.0), smoothstep(0.15, 0.5, refl_rough));
+    }
     if (!reflects) {
         ambient = e_amb * ambient_albedo / PI;
     }
@@ -825,7 +951,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     if (in_cab > 0.5 && camera.lamp_atlas.w > 0.5) {
         cabin_vis = cabin_visibility(in.world, n);
     }
-    let cabin_light = interior_lamps(in.world, n, in.params2.z) * cabin_vis;
+    let cabin_light = interior_lamps_area(in.world, n, in.params2.z) * cabin_vis;
     let cabin = sf_lit.albedo * cabin_light * mix(1.0, ao, 0.85);
     var rgb = (direct + ambient + lamps) * pre + cabin;
     // A material's own emissive colour ([matl_allcolor], an .x's emissive) is the texture at
@@ -890,7 +1016,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             emit = emit + max(display_level(tex.rgb) * enh.exposure.y - rgb, vec3<f32>(0.0)) * lm * cabin_vis;
         }
     }
-    if (material.emissive.w < -1.5) {
+    if (!LEAN && material.emissive.w < -1.5) {
         // an LED panel (see MaterialExtra::led): the lit dots - the alpha the `\S:n` script
         // texture carries, in the colour of the panel's own texture - are the panel's own
         // light, drawn as bright as the settings ask for (`Led glow`, 16 levels, 0 = off).
@@ -909,14 +1035,18 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // a display's text (see MaterialExtra::display)
         emit = emit + tex.rgb * 0.35 * max(enh.exposure.z * 2.0, 0.8) * display_dim(1.0);
     }
-    if (material.glow.x > 0.0) {
+    if (!LEAN && material.glow.x > 0.0) {
         // [matl_glow] (see `matl_glow_light`): the material is its own light, drawn in HDR.
         // The classic picture does not know the keyword (`params2.x` is off, see
         // `add_material_extra`).
         emit = emit + matl_glow_light(buv, tex.rgb);
     }
+    if (!LEAN && material.emission.w > 0.5) {
+        // [matl_emissive] (see `emission_light`); the classic picture does not draw it
+        emit = emit + emission_light(buv, tex.rgb, in.params2.x, pre);
+    }
     rgb = rgb + emit;
-    if (enh.debug.x > 0.5) {
+    if (!LEAN && enh.debug.x > 0.5) {
         // OMSI_DEBUG_ENHANCED: one term alone, as it lands on the screen
         let dm = i32(enh.debug.x);
         var dc = vec3<f32>(0.0);
@@ -941,6 +1071,10 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             case 15: { dc = lamps * pre; }
             case 16: { dc = emit; }
             case 17: { dc = vec3<f32>(rough, f0.g * 10.0, metal); }
+            // (the traced global illumination: the bounced light as it lands, the sky's
+            // visibility; magenta where there is none)
+            case 18: { dc = select(vec3<f32>(1.0, 0.0, 1.0), gi.rgb * ambient_albedo / PI * pre, gi.a >= 0.0); }
+            case 19: { dc = select(vec3<f32>(1.0, 0.0, 1.0), vec3<f32>(gi.a), gi.a >= 0.0); }
             default: { dc = vec3<f32>(alpha, f32(glass), f32(has_env)); }
         }
         return vec4<f32>(dc, 1.0);
